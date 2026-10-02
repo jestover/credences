@@ -87,6 +87,10 @@ approximate silently.
 - Manage the new project as a **uv library**, with `src/credences/`, `py.typed`,
   `pyproject.toml`, and committed `uv.lock`. Use uv for dependencies, environments,
   development commands, and builds (SPEC §12, §15; PLAN Phase 0).
+- Planning documents are temporary implementation context, not shipped API
+  documentation. Docstrings, code comments, and test explanations must describe
+  behavior directly; do not cite `SPEC.md`, `DECISIONS.md`, or `PLAN.md`. References
+  to durable package documentation or other code are fine.
 - One core operation. Resist adding task verbs, wide rating scales,
   multi-attribute modes, scheduling, or checkpointing (`DECISIONS.md` D2, D12).
 - Task-prompt construction, code assignment, option randomization, and semantic

@@ -17,5 +17,5 @@ winners versus probability-rounding ties, normalization without label-level
 renormalization, candidate-order invariance, and caller-owned randomness.
 
 Run with `uv run pytest`. No tokenizer, model weights, or backend are required.
-Add the remaining contract-focused tests from `PLAN.md` and `SPEC.md` as each
-implementation step is introduced.
+Extend these behavioral contracts as the selector, production trie,
+tokenization, and backend implementations are introduced.

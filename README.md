@@ -43,8 +43,10 @@ downloaded now.
 
 `Measurement` and `RawReadout` are available from `credences`. They are data
 containers for already-computed results; they do not calculate probabilities or
-run a model. Their fields follow SPEC §6. The dataclasses prevent field
-reassignment, but their dictionaries are not deeply immutable.
+run a model. A measurement holds the probability vector, exact winning labels,
+and confidence summaries. Its raw readout holds natural-log credences, selected
+complete token paths, and fixed-context token count. The dataclasses prevent
+field reassignment, but their dictionaries are not deeply immutable.
 
 `measurement.to_dict()` returns a detached snapshot suitable for
 `json.dumps(..., allow_nan=False)`, with the same named fields and a nested `raw`

@@ -17,8 +17,9 @@ from credences.probabilities import (
     validate_readout,
 )
 
-# Both forms are explicit fixtures, not tokenizer assumptions. The second is
-# SPEC §8.4; the last needs a grouped END event. END ids are outside these paths.
+# Both forms are explicit fixtures, not tokenizer assumptions. The second
+# changes branch points with form selection; the last needs a grouped stopping
+# event. END ids are outside all candidate paths.
 FORM_SETS = [
     {"A": ((0,), (1,)), "B": ((2,), (3,))},
     {"positive": ((0, 1), (4,)), "position": ((0, 2, 3), (5,))},

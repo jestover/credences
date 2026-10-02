@@ -34,9 +34,18 @@ class RawReadout:
 class Measurement:
     """The credence vector, its derived summaries, and the raw readout.
 
-    Entropy is in bits. ``top_labels`` contains all exact winners in candidate
-    order. Fields cannot be reassigned, but the dictionaries are not deeply
-    immutable. No run metadata or reasoning policy is stored on the result.
+    ``credences`` maps each candidate to its forced-choice probability.
+    ``entropy`` is Shannon entropy in bits, with zero-mass terms omitted.
+    ``top_labels`` contains every exact maximizer of log credence in candidate
+    order, without rounding or random tie-breaking.
+
+    For K candidates and sorted probabilities p1 >= p2 >= ...:
+    ``top_label_confidence`` is (p1 - 1/K) / (1 - 1/K);
+    ``entropy_confidence`` is 1 - entropy / log2(K);
+    ``margin_confidence`` is p1 - p2.
+
+    Fields cannot be reassigned, but the dictionaries are not deeply immutable.
+    No run metadata or reasoning policy is stored on the result.
     """
 
     credences: dict[str, float]
@@ -102,7 +111,7 @@ def validate_readout(wanted: Iterable[int], readout: Mapping[int, float]) -> dic
 
 
 def masked_logprobs(allowed: Iterable[int], readout: Mapping[int, float]) -> dict[int, float]:
-    """Apply SPEC §5.1's transition rule over distinct allowed token ids.
+    """Return natural-log probabilities over distinct allowed token ids.
 
     A singleton is forced without inspecting the readout. Branches validate
     every allowed score, then normalize in log space. All -inf scores yield a
@@ -189,6 +198,8 @@ def measurement_from_raw(raw: RawReadout) -> Measurement:
     ) / math.log(2)
     largest, second = sorted(credences.values(), reverse=True)[:2]
     count = len(credences)
+    # frozen=True prevents field reassignment, not edits to dictionary contents.
+    # Own the mappings so changes to the input cannot invalidate these summaries.
     snapshot = RawReadout(
         credence_logprobs=logs,
         scored_token_ids={label: tuple(raw.scored_token_ids[label]) for label in logs},
@@ -206,6 +217,8 @@ def measurement_from_raw(raw: RawReadout) -> Measurement:
 
 
 class _ChoiceRng(Protocol):
+    """Typing interface for a caller-owned RNG; no runtime validation or state."""
+
     def choice(self, seq: Sequence[str], /) -> str: ...
 
 
@@ -217,14 +230,31 @@ def choose_top_label(measurement: Measurement, *, rng: _ChoiceRng) -> str:
 
 
 def top_label_weights(measurement: Measurement) -> dict[str, float]:
-    """Fractional winner-count weights, not candidate credences (SPEC §6.4)."""
+    """Return equal counting weights for exact winners, not their credences.
+
+    With N winners, each gets weight 1/N in top_labels order; non-winners
+    are omitted. Summing across measurements gives fractional winner counts.
+    For example, two winners with credence 0.4 each receive counting weight
+    0.5 each. The measurement is unchanged. An empty winner set raises.
+    """
     if not measurement.top_labels:
         raise ValueError("A measurement must have at least one top label")
     return dict.fromkeys(measurement.top_labels, 1 / len(measurement.top_labels))
 
 
 def _shifted_normalizer(values: Sequence[float]) -> tuple[float, float]:
-    """Return the finite maximum and log normalizer relative to it."""
+    """Return (m, correction), where m is the maximum input log weight.
+
+    correction = log(sum(exp(value - m))) over all input values.
+    Subtracting m makes each exponential at most 1, avoiding overflow.
+    Keep m and correction separate: adding them first can lose the small
+    correction at large offsets, corrupting subsequent log probabilities.
+
+    One maximum contributes exactly 1. Exclude it from the tail and use
+    log1p(tail) to retain small corrections that log(1 + tail) would lose to
+    rounding. fsum reduces rounding when adding the remaining weights.
+    Input must be nonempty and contain at least one finite value.
+    """
     maximum = max(values)
     peak = values.index(maximum)
     # Exclude one maximum (weight 1), then use log1p to preserve corrections
