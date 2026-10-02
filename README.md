@@ -2,9 +2,10 @@
 
 LLM credence vectors over fixed answer sets.
 
-**Status:** library scaffold and agreed design documents. The measurement API is
-not implemented yet. Start implementation from `PLAN.md`, not the illustrative
-API examples as though they already exist.
+**Status:** library scaffold, result dataclasses, and JSON serialization are
+implemented. Model loading and the measurement API are not implemented yet.
+Continue from `PLAN.md`, not the illustrative API examples as though they
+already exist.
 
 ## Development setup
 
@@ -25,19 +26,34 @@ The `dev` group includes pytest, Hypothesis, Ruff, and import-linter. The packag
 has no runtime dependencies yet; model and DataFrame integrations will be optional
 extras as they are implemented. No model weights are needed for this scaffold.
 
-The test suite is currently empty, so `uv run pytest` reports no tests (exit 5).
-The GitHub Actions workflow runs the checks above and temporarily accepts that
-specific exit code; other pytest failures still fail CI. Remove this allowance
-when the first contract tests are added.
+The GitHub Actions workflow runs the checks above and requires pytest to pass.
+The first tests cover the result and serialization contract, including a
+Hypothesis property test that preserves finite logs when probabilities underflow.
 
 CI also installs the built wheel into an isolated environment and checks that it
 imports, includes `py.typed`, and has no runtime dependencies. Import-linter is
-configured to inspect the package, but no dependency-tier contracts exist yet:
-add them as the planned modules are introduced. The opt-in MLX job will follow
-when real-model tests and the MLX extra exist; no model weights are downloaded now.
+configured to keep result types free of tokenizer, backend, and DataFrame
+dependencies; extend the contracts as modules are introduced. The opt-in MLX job
+will follow when real-model tests and the MLX extra exist; no model weights are
+downloaded now.
 
-No measurement behavior or placeholder public API has been added. The next small
-implementation step is Phase 1's result objects and serialization contract.
+## Implemented result contract
+
+`Measurement` and `RawReadout` are available from `credences`. They are data
+containers for already-computed results; they do not calculate probabilities or
+run a model. Their fields follow SPEC §6. The dataclasses prevent field
+reassignment, but their dictionaries are not deeply immutable.
+
+`measurement.to_dict()` returns a detached snapshot suitable for
+`json.dumps(..., allow_nan=False)`, with the same named fields and a nested `raw`
+dictionary. Winner tuples and token paths become lists. Exact-zero log credences
+(`-inf`) become JSON `null`; finite logs remain numbers even if the corresponding
+probability has underflowed to zero. Invalid nonfinite values raise `ValueError`
+rather than producing nonstandard JSON. Serialization does not round,
+renormalize, or recompute the result.
+
+No measurement behavior or placeholder loading API has been added. The next
+small implementation step is the pure probability calculations and their tests.
 
 ## Design documents
 

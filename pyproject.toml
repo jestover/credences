@@ -27,6 +27,26 @@ testpaths = ["tests"]
 root_package = "credences"
 include_external_packages = true
 
+[[tool.importlinter.contracts]]
+name = "Result types stay tokenizer- and backend-free"
+type = "forbidden"
+source_modules = ["credences.probabilities"]
+forbidden_modules = [
+    "credences.tokenization",
+    "credences.reasoning",
+    "credences.model",
+    "credences.credoscope",
+    "credences.backends",
+    "credences.frames",
+    "transformers",
+    "tokenizers",
+    "mlx",
+    "mlx_lm",
+    "torch",
+    "pandas",
+    "polars",
+]
+
 [dependency-groups]
 dev = [
     "hypothesis>=6.168.3",
