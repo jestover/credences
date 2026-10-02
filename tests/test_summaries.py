@@ -122,9 +122,17 @@ def test_summaries_match_definitions_and_are_invariant_to_candidate_order(scores
 
 
 def test_exact_log_winners_do_not_become_probability_rounding_ties():
-    result = measurement_from_raw(
-        _raw({"A": -0.9162907318741552, "B": -0.9162907318741553, "C": math.log(0.2)})
-    )
+    # Adjacent log values can share a rounded probability, but the particular
+    # pair differs between platform math libraries. Find a real local pair.
+    first = math.log(0.4)
+    for _ in range(64):
+        second = math.nextafter(first, -math.inf)
+        if math.exp(first) == math.exp(second):
+            break
+        first = second
+    else:
+        pytest.fail("Could not construct an adjacent-log probability rounding tie")
+    result = measurement_from_raw(_raw({"A": first, "B": second, "C": math.log(0.2)}))
 
     assert result.credences["A"] == result.credences["B"]
     assert result.margin_confidence == 0.0

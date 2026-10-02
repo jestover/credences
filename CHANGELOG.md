@@ -14,3 +14,6 @@
 - Bound tiny positive grouped-event roundoff at log probability 0, with excess
   event mass beyond the same tolerance remaining an error. General logsumexp
   stays unbounded; raw results are not repaired or renormalized.
+- Construct the exact-log winner regression's rounded-probability tie using
+  the current math library rather than assuming identical exp rounding on
+  macOS and Linux.
