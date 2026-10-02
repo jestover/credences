@@ -2,10 +2,10 @@
 
 LLM credence vectors over fixed answer sets.
 
-**Status:** library scaffold, result dataclasses, and JSON serialization are
-implemented. Model loading and the measurement API are not implemented yet.
-Continue from `PLAN.md`, not the illustrative API examples as though they
-already exist.
+**Status:** the pure probability calculations, confidence summaries, result
+dataclasses, JSON serialization, and tie helpers are implemented. The production
+trie, model loading, and measurement API are not implemented yet. Continue from
+`PLAN.md`, not the illustrative API examples as though they already exist.
 
 ## Development setup
 
@@ -27,12 +27,14 @@ has no runtime dependencies yet; model and DataFrame integrations will be option
 extras as they are implemented. No model weights are needed for this scaffold.
 
 The GitHub Actions workflow runs the checks above and requires pytest to pass.
-The first tests cover the result and serialization contract, including a
-Hypothesis property test that preserves finite logs when probabilities underflow.
+Tests cover result persistence, branch probability rules, confidence summaries,
+and caller-controlled tie handling. Hypothesis checks selected-path chain-rule
+math against an independent Decimal reference, as well as normalization,
+candidate-order invariance, and finite logs through probability underflow.
 
 CI also installs the built wheel into an isolated environment and checks that it
 imports, includes `py.typed`, and has no runtime dependencies. Import-linter is
-configured to keep result types free of tokenizer, backend, and DataFrame
+configured to keep pure math free of tokenizer, backend, and DataFrame
 dependencies; extend the contracts as modules are introduced. The opt-in MLX job
 will follow when real-model tests and the MLX extra exist; no model weights are
 downloaded now.
@@ -52,8 +54,42 @@ probability has underflowed to zero. Invalid nonfinite values raise `ValueError`
 rather than producing nonstandard JSON. Serialization does not round,
 renormalize, or recompute the result.
 
-No measurement behavior or placeholder loading API has been added. The next
-small implementation step is the pure probability calculations and their tests.
+## Implemented probability rules and summaries
+
+The internal pure math layer normalizes over distinct allowed token ids in log
+space. Singleton transitions are forced without scores. All-`-inf` branches
+fall back to uniform tokens; otherwise `-inf` tokens get zero. Missing, NaN, or
+positive-infinity requested scores raise `BackendReadoutError`. END tokens are
+normalized individually and their probabilities are then aggregated.
+Grouped events correct tiny positive log-probability roundoff at the unit-mass
+boundary, while larger excess mass remains an error; negative logs are preserved.
+
+The result builder derives the vector and summaries from normalized log
+credences. It checks total mass within `1e-12` relative tolerance, never adds a
+label-level renormalization, and identifies winners using exact log comparisons.
+For `K` candidates and sorted credences `p1 >= p2 >= ...`:
+
+| Summary | Definition |
+|---|---|
+| `entropy` | Shannon entropy in bits, with zero-mass terms omitted |
+| `top_label_confidence` | `(p1 - 1/K) / (1 - 1/K)` |
+| `entropy_confidence` | `1 - entropy / log2(K)` |
+| `margin_confidence` | `p1 - p2` |
+
+Confidence values are bounded to `[0, 1]` to remove boundary roundoff, without
+rounding the vector or raw logs. Backend logits will be supplied as float32;
+pure computations use Python's higher-precision floats. See `CHANGELOG.md` for
+the numerical-policy clarification.
+
+Two optional helpers are available from `credences`:
+`choose_top_label(measurement, rng=...)` uses only a caller-supplied RNG;
+`top_label_weights(measurement)` gives equal counting weights to tied winners,
+not their credences.
+
+The current parity test drives these primitives with a test-only selected-path
+adapter. It does not yet verify a production trie or backend. The next small
+implementation step is the selector, trie, and branch readout plan, wiring that
+same independent reference into production-trie parity tests.
 
 ## Design documents
 

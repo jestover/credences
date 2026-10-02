@@ -28,9 +28,9 @@ root_package = "credences"
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
-name = "Result types stay tokenizer- and backend-free"
+name = "Pure probability math stays tokenizer- and backend-free"
 type = "forbidden"
-source_modules = ["credences.probabilities"]
+source_modules = ["credences.probabilities", "credences.errors"]
 forbidden_modules = [
     "credences.tokenization",
     "credences.reasoning",

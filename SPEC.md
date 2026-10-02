@@ -528,6 +528,9 @@ chain rule including forced transitions and all-`-inf` fallback.
   0; an all-`-inf` branching step contributes `-ln(n)` for each of its `n`
   tokens. Implement these cases explicitly. An `END` event uses `logsumexp`
   over its normalized token logprobs, including in the fallback case.
+  Bound positive grouped-event roundoff at log probability 0 only when excess
+  mass is within relative tolerance `1e-12`; larger excess mass raises.
+  Preserve negative event logs, including tiny finite values and `-inf`.
 - A candidate's log credence is the sum of step logprobs along its selected path.
   There is no sum across forms. For `"very negative"` in §5.2:
 
@@ -536,9 +539,14 @@ chain rule including forced transitions and all-`-inf` fallback.
   Exponentiating gives about `0.1020`. Preserve a finite log credence even when
   exponentiation underflows to `0.0`; exact zero mass has log credence `-inf`.
   Determine winning labels from unrounded log credences (§6.4).
-- Allowed-set log-softmax uses **float32**, casting up bf16/fp16 logits first.
+- The backend casts requested bf16/fp16 logits to **float32** before returning
+  them. Pure allowed-set log-softmax, grouped-event sums, and path accumulation
+  use Python's higher-precision floats (normally float64). Subtract the maximum
+  before normalization so large common offsets cannot erase branch weights.
+  This also preserves finite log differences across the finite float32 range.
   Avoid forming full-vocabulary probabilities before extracting allowed scores.
-  Quantized weights still measure the loaded quantized model.
+  Higher-precision arithmetic cannot recover information lost in the model's
+  logits; quantized weights still measure the loaded quantized model.
 - A fixed absolute probability error can be large relative to a small probability.
   Log-space arithmetic avoids additional underflow; it cannot undo upstream
   quantization/logit error. Max selection does not guarantee better accuracy or
@@ -623,6 +631,10 @@ class Measurement:
   principles**. CDS is the key literature bridge because its binary inner
   confidence is the shared special case or monotone reference point, but the API
   is not organized around reproducing one scalar from that paper.
+- The pure result builder checks that exponentiated log credences sum to 1
+  within relative tolerance `1e-12`, without label-level renormalization.
+  Confidence summaries are bounded to `[0, 1]` to remove boundary roundoff;
+  credences and entropy are not rounded or renormalized.
 - Experiment metadata, model identifiers, versions, and semantic mappings live
   in caller-owned data, not a per-measurement metadata object. There is no
   `Measurement.reasoning`: bypass is the only supported mode. The raw readout
@@ -773,7 +785,7 @@ for each candidate c with selected path T(c):
     if another selected path continues through T(c):
         log_credence(c) += logsumexp(
             step_logprob(T(c), e) for e in END
-        )
+        )  # bound positive grouped-event roundoff at 0 per §5.5
 ```
 
 The normalized transitions and stopping events partition mass among candidates,
