@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install locked development environment
+        run: uv sync --locked --group dev
+      - name: Lint
+        run: uv run ruff check .
+      - name: Check formatting
+        run: uv run ruff format --check .
+      - name: Check import graph
+        # Add dependency-tier contracts as the actual modules are introduced.
+        run: uv run lint-imports
+      - name: Run tests
+        # Temporary scaffold allowance; remove when the first tests are added.
+        run: |
+          status=0
+          uv run pytest || status=$?
+          if [ "$status" -eq 5 ]; then
+            echo "Scaffold only: no tests collected. Measurement is not implemented."
+          elif [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+      - name: Build source distribution and wheel
+        run: uv build
+      - name: Verify installed wheel in an isolated environment
+        run: |
+          uv run --isolated --no-project --with dist/credences-*.whl python -I -c '
+          from importlib import metadata, resources
+          import credences
+
+          assert resources.files(credences).joinpath("py.typed").is_file(), "Missing typed marker"
+          assert not metadata.requires("credences"), "Unexpected runtime dependencies"
+          print("Installed credences", metadata.version("credences"), "from", credences.__file__)
+          '
