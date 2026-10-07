@@ -91,6 +91,9 @@ approximate silently.
   documentation. Docstrings, code comments, and test explanations must describe
   behavior directly; do not cite `SPEC.md`, `DECISIONS.md`, or `PLAN.md`. References
   to durable package documentation or other code are fine.
+- Include small runnable examples for non-obvious core behavior, and a shared
+  walkthrough when several objects interact. Keep examples checked by the normal
+  test run so they stay useful as the code evolves. Round display output only.
 - One core operation. Resist adding task verbs, wide rating scales,
   multi-attribute modes, scheduling, or checkpointing (`DECISIONS.md` D2, D12).
 - Task-prompt construction, code assignment, option randomization, and semantic

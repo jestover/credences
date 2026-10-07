@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add small runnable examples to the core docstrings and a durable pure-core
+  walkthrough covering selection, trie scoring, results, JSON, and ties.
+  Run the examples as doctests in ordinary CI to prevent documentation drift.
 - Add named complete-path selection, conservative alternative-path preflight,
   and immutable selected-trie readout plans. Shared prefixes normalize once;
   leaves and singleton transitions require no additional scores.

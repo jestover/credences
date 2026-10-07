@@ -23,6 +23,16 @@ class RawReadout:
     Log credences use natural logarithms. Negative infinity means exact zero
     mass; a finite log remains meaningful even when its probability underflows.
     Paths contain only the selected form, not discarded forms or a full trace.
+
+    A multi-token selected answer keeps its whole path, excluding context:
+
+    >>> raw = RawReadout(
+    ...     credence_logprobs={"A": math.log(0.75), "B": math.log(0.25)},
+    ...     scored_token_ids={"A": (10, 11), "B": (20,)},
+    ...     context_token_count=7,
+    ... )
+    >>> raw.scored_token_ids["A"]
+    (10, 11)
     """
 
     credence_logprobs: dict[str, float]
@@ -67,6 +77,22 @@ class Measurement:
         Nonfinite credences or summaries, and NaN/positive-infinity log
         credences, raise ValueError rather than leaking invalid JSON values.
         This method does not recompute, round, or normalize any measurement.
+
+        Underflowed finite logs survive; exact-zero logs become JSON null:
+
+        >>> import json
+        >>> raw = RawReadout(
+        ...     {"A": 0.0, "tiny": -1000.0, "zero": -math.inf},
+        ...     {"A": (1,), "tiny": (2,), "zero": (3,)}, 7,
+        ... )
+        >>> result = measurement_from_raw(raw)
+        >>> exported = result.to_dict()
+        >>> exported["raw"]["credence_logprobs"]
+        {'A': 0.0, 'tiny': -1000.0, 'zero': None}
+        >>> exported["raw"]["scored_token_ids"]["A"]
+        [1]
+        >>> json.loads(json.dumps(exported, allow_nan=False))["top_labels"]
+        ['A']
         """
         return {
             "credences": {
@@ -96,6 +122,11 @@ def validate_readout(wanted: Iterable[int], readout: Mapping[int, float]) -> dic
     Use this for the complete initial selection readout, even if its selected
     root later becomes forced. Missing/NaN/+inf scores are contract violations,
     never zeros. Negative infinity is valid and remains negative infinity.
+
+    Positive logits are valid; repeated wanted IDs are checked once:
+
+    >>> validate_readout([10, 10, 20], {10: 2.0, 20: -math.inf, 99: 8.0})
+    {10: 2.0, 20: -inf}
     """
     scores = {}
     for token in dict.fromkeys(wanted):
@@ -118,6 +149,17 @@ def masked_logprobs(allowed: Iterable[int], readout: Mapping[int, float]) -> dic
     token-uniform distribution; otherwise individual -inf scores retain zero
     mass. END ids are ordinary tokens here; callers aggregate their logprobs
     with logprob_sum rather than treating END as one token.
+
+    Normalize logits, not already-normalized probabilities. Round only display:
+
+    >>> logs = masked_logprobs([10, 20], {10: 2.0, 20: 1.0})
+    >>> {token: round(math.exp(value), 6) for token, value in logs.items()}
+    {10: 0.731059, 20: 0.268941}
+    >>> masked_logprobs([12], {})  # Forced: no score required.
+    {12: 0.0}
+    >>> fallback = masked_logprobs([10, 20], {10: -math.inf, 20: -math.inf})
+    >>> [round(math.exp(value), 6) for value in fallback.values()]
+    [0.5, 0.5]
     """
     tokens = tuple(dict.fromkeys(allowed))
     if not tokens:
@@ -140,6 +182,13 @@ def logsumexp(values: Iterable[float]) -> float:
     Empty input or all -inf returns -inf. NaN and +inf raise ValueError.
     Positive output is valid for arbitrary weights. Use logprob_sum for
     grouped normalized events such as END; never sum alternative forms.
+
+    Two unit weights sum to 2, so their summed log weight is positive:
+
+    >>> round(logsumexp([0.0, 0.0]), 6)
+    0.693147
+    >>> logsumexp([])
+    -inf
     """
     weights = tuple(_log_weight(value, "log weight") for value in values)
     if not weights or all(value == -math.inf for value in weights):
@@ -155,6 +204,14 @@ def logprob_sum(values: Iterable[float]) -> float:
     only within the shared normalization tolerance; otherwise raise.
     Tiny positive output caused by grouping roundoff becomes 0. Negative
     logs, including tiny finite values and -inf, are never rounded away.
+
+    Two END tokens compete with one continuation token. Group only after
+    normalizing all three distinct IDs:
+
+    >>> steps = masked_logprobs([11, 99, 100], {11: 0.0, 99: 0.0, 100: 0.0})
+    >>> stopping = logprob_sum(steps[token] for token in (99, 100))
+    >>> round(math.exp(stopping), 6)
+    0.666667
     """
     probabilities = tuple(_log_weight(value, "log probability") for value in values)
     if any(value > 0 for value in probabilities):
@@ -176,6 +233,21 @@ def measurement_from_raw(raw: RawReadout) -> Measurement:
     Confidence summaries are bounded to [0, 1] to remove boundary roundoff;
     credences and entropy are not rounded or renormalized. Input dictionaries
     are copied so subsequent caller edits cannot change the built result.
+
+    >>> raw = RawReadout(
+    ...     {"A": math.log(0.6), "B": math.log(0.2), "C": math.log(0.2)},
+    ...     {"A": (10,), "B": (20,), "C": (30,)}, 7,
+    ... )
+    >>> result = measurement_from_raw(raw)
+    >>> result.top_labels
+    ('A',)
+    >>> tuple(round(value, 6) for value in (
+    ...     result.top_label_confidence, result.entropy_confidence, result.margin_confidence,
+    ... ))
+    (0.4, 0.135026, 0.4)
+    >>> raw.credence_logprobs["A"] = -math.inf  # Input edits do not change the snapshot.
+    >>> result.raw.credence_logprobs["A"] == math.log(0.6)
+    True
     """
     if len(raw.credence_logprobs) < 2:
         raise ValueError("A measurement requires at least two candidates")
@@ -223,7 +295,16 @@ class _ChoiceRng(Protocol):
 
 
 def choose_top_label(measurement: Measurement, *, rng: _ChoiceRng) -> str:
-    """Uniformly choose an exact winner using only the caller's RNG."""
+    """Uniformly choose an exact winner using only the caller's RNG.
+
+    >>> import random
+    >>> tied = measurement_from_raw(RawReadout(
+    ...     {"A": -math.log(2), "B": -math.log(2)},
+    ...     {"A": (10,), "B": (20,)}, 7,
+    ... ))
+    >>> choose_top_label(tied, rng=random.Random(7)) in tied.top_labels
+    True
+    """
     if not measurement.top_labels:
         raise ValueError("A measurement must have at least one top label")
     return rng.choice(measurement.top_labels)
@@ -236,6 +317,13 @@ def top_label_weights(measurement: Measurement) -> dict[str, float]:
     are omitted. Summing across measurements gives fractional winner counts.
     For example, two winners with credence 0.4 each receive counting weight
     0.5 each. The measurement is unchanged. An empty winner set raises.
+
+    >>> result = measurement_from_raw(RawReadout(
+    ...     {"A": math.log(0.4), "B": math.log(0.4), "C": math.log(0.2)},
+    ...     {"A": (10,), "B": (20,), "C": (30,)}, 7,
+    ... ))
+    >>> top_label_weights(result)
+    {'A': 0.5, 'B': 0.5}
     """
     if not measurement.top_labels:
         raise ValueError("A measurement must have at least one top label")
@@ -254,6 +342,15 @@ def _shifted_normalizer(values: Sequence[float]) -> tuple[float, float]:
     log1p(tail) to retain small corrections that log(1 + tail) would lose to
     rounding. fsum reduces rounding when adding the remaining weights.
     Input must be nonempty and contain at least one finite value.
+
+    Large logits remain safe, and tiny tail corrections are not rounded away:
+
+    >>> maximum, correction = _shifted_normalizer((1000.0, 999.0))
+    >>> maximum, round(correction, 6)
+    (1000.0, 0.313262)
+    >>> _, tiny_correction = _shifted_normalizer((0.0, -40.0))
+    >>> tiny_correction > 0.0
+    True
     """
     maximum = max(values)
     peak = values.index(maximum)

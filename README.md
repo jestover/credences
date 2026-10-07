@@ -7,6 +7,13 @@ calculations, confidence summaries, result dataclasses, JSON serialization, and
 tie helpers are implemented. Tokenization, model loading, and the model-backed
 measurement API are not implemented yet.
 
+## Worked examples
+
+Start with [small examples of the pure core](docs/pure-core.md): candidate paths
+through selection and trie scoring, result construction, JSON, ties, and
+numerical edge cases. Core docstrings also contain small runnable examples.
+The normal test command checks both, alongside the behavioral tests.
+
 ## Development setup
 
 This is a Python >= 3.14 library, initialized with `uv init --lib` and built with

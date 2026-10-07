@@ -22,6 +22,11 @@ or singleton queries. Long forced chains are not recursion-limited.
 winners versus probability-rounding ties, normalization without label-level
 renormalization, candidate-order invariance, and caller-owned randomness.
 
+`test_documentation.py` executes doctest examples from explicitly listed
+backend-free modules and the Markdown walkthrough under `docs/`. These guard
+against documentation drift without enabling project-wide source imports that
+could accidentally load future optional model runtimes during collection.
+
 Run with `uv run pytest`. No tokenizer, model weights, or backend are required.
 Extend these behavioral contracts as tokenization and backend implementations
 are introduced.
