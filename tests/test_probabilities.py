@@ -16,6 +16,13 @@ from credences.probabilities import (
     measurement_from_raw,
     validate_readout,
 )
+from credences.trie import (
+    CandidatePaths,
+    build_trie,
+    first_token_ids,
+    select_paths,
+    validate_potential_paths,
+)
 
 # Both forms are explicit fixtures, not tokenizer assumptions. The second
 # changes branch points with form selection; the last needs a grouped stopping
@@ -40,8 +47,16 @@ LOGIT = st.one_of(
 
 
 @st.composite
+def generated_forms(draw):
+    count = draw(st.integers(min_value=2, max_value=6))
+    path = st.lists(st.integers(0, 9), min_size=1, max_size=5).map(tuple)
+    paths = draw(st.lists(path, min_size=2 * count, max_size=2 * count, unique=True))
+    return {str(index): (paths[2 * index], paths[2 * index + 1]) for index in range(count)}
+
+
+@st.composite
 def selected_path_cases(draw):
-    forms = draw(st.sampled_from(FORM_SETS))
+    forms = draw(st.one_of(st.sampled_from(FORM_SETS), generated_forms()))
     paths = [path for alternatives in forms.values() for path in alternatives]
     prefixes = sorted({path[:i] for path in paths for i in range(len(path))})
     logits = {}
@@ -107,41 +122,27 @@ def _naive_reference(forms, logits):
     return selected, result
 
 
-def _chain_using_primitives(forms, logits):
-    """Test-only integration driver, to be replaced by the production trie later."""
-    first_ids = {path[0] for alternatives in forms.values() for path in alternatives}
-    first = validate_readout(sorted(first_ids), logits[()])
-    selected = {
-        label: spaced if first[spaced[0]] > first[bare[0]] else bare
-        for label, (bare, spaced) in forms.items()
+def _score_selected_trie(forms, logits):
+    """Drive the production selector and plan using declared scores, not a model."""
+    prepared = {
+        label: CandidatePaths(bare=bare, spaced=spaced) for label, (bare, spaced) in forms.items()
     }
-    edges = {}
-    for path in selected.values():
-        for depth, token in enumerate(path):
-            edges.setdefault(path[:depth], set()).add(token)
-    for path in selected.values():
-        if path in edges:
-            edges[path].update(END)
-    steps = {
-        prefix: masked_logprobs(
-            sorted(tokens), {} if len(tokens) == 1 else first if not prefix else logits[prefix]
-        )
-        for prefix, tokens in edges.items()
-    }
-    result = {}
-    for label, path in selected.items():
-        factors = [steps[path[:depth]][token] for depth, token in enumerate(path)]
-        if path in edges:
-            factors.append(logprob_sum(steps[path][token] for token in END))
-        result[label] = math.fsum(factors)
-    return selected, result
+    validate_potential_paths(prepared, end_tokens=END)
+    wanted = first_token_ids(prepared)
+    first = validate_readout(wanted, logits[()])
+    selected = select_paths(prepared, first)
+    plan = build_trie(selected, end_tokens=END)
+    readouts = {(): first}
+    for request in plan.additional_readouts:
+        readouts[request.prefix] = logits[request.prefix]
+    return selected, plan.score(readouts)
 
 
 @given(case=selected_path_cases())
 def test_selected_chain_rule_matches_independent_reference(case):
     forms, logits = case
     expected_paths, expected_logs = _naive_reference(forms, logits)
-    paths, logs = _chain_using_primitives(forms, logits)
+    paths, logs = _score_selected_trie(forms, logits)
 
     assert paths == expected_paths
     assert logs == pytest.approx(expected_logs, abs=1e-12)
@@ -149,6 +150,12 @@ def test_selected_chain_rule_matches_independent_reference(case):
     result = measurement_from_raw(RawReadout(logs, paths, 0))
     assert result.raw.credence_logprobs == logs
     assert math.isfinite(result.entropy)
+    reversed_paths, reversed_logs = _score_selected_trie(
+        dict(reversed(list(forms.items()))), logits
+    )
+    assert list(reversed_paths) == list(reversed(paths))
+    assert reversed_paths == paths
+    assert reversed_logs == pytest.approx(logs, abs=1e-12)
 
 
 def test_forced_transition_does_not_even_inspect_the_readout():
@@ -169,7 +176,7 @@ def test_uniform_fallback_counts_distinct_tokens_and_groups_end_mass():
 def test_token_uniform_fallback_is_not_label_uniform():
     forms = FORM_SETS[2]
     logits = {(): {token: -math.inf for token in range(10)}, (0,): {1: -math.inf, 5: -math.inf}}
-    _, logs = _chain_using_primitives(forms, logits)
+    _, logs = _score_selected_trie(forms, logits)
 
     assert {label: math.exp(value) for label, value in logs.items()} == pytest.approx(
         {
@@ -283,7 +290,7 @@ def test_zero_incoming_mass_stays_zero_after_uniform_fallback():
 def test_positive_position_golden_shapes_only_score_selected_branches(
     first, later, expected_paths, expected_credences
 ):
-    paths, logs = _chain_using_primitives(FORM_SETS[1], {(): first, **later})
+    paths, logs = _score_selected_trie(FORM_SETS[1], {(): first, **later})
 
     assert paths == expected_paths
     assert {label: math.exp(value) for label, value in logs.items()} == pytest.approx(

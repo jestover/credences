@@ -2,10 +2,10 @@
 
 LLM credence vectors over fixed answer sets.
 
-**Status:** the pure probability calculations, confidence summaries, result
-dataclasses, JSON serialization, and tie helpers are implemented. The production
-trie, model loading, and measurement API are not implemented yet. Continue from
-`PLAN.md`, not the illustrative API examples as though they already exist.
+**Status:** the pure candidate-path selector, trie/readout plans, probability
+calculations, confidence summaries, result dataclasses, JSON serialization, and
+tie helpers are implemented. Tokenization, model loading, and the model-backed
+measurement API are not implemented yet.
 
 ## Development setup
 
@@ -24,12 +24,13 @@ uv build
 
 The `dev` group includes pytest, Hypothesis, Ruff, and import-linter. The package
 has no runtime dependencies yet; model and DataFrame integrations will be optional
-extras as they are implemented. No model weights are needed for this scaffold.
+extras as they are implemented. No model weights are needed for the pure core.
 
 The GitHub Actions workflow runs the checks above and requires pytest to pass.
-Tests cover result persistence, branch probability rules, confidence summaries,
-and caller-controlled tie handling. Hypothesis checks selected-path chain-rule
-math against an independent Decimal reference, as well as normalization,
+Tests cover result persistence, selected-trie scoring, exact readout requirements,
+confidence summaries, and caller-controlled tie handling. Hypothesis checks
+production selection and trie scoring against an independent Decimal reference
+across generated paths and golden examples, as well as normalization,
 candidate-order invariance, and finite logs through probability underflow.
 
 CI also installs the built wheel into an isolated environment and checks that it
@@ -88,10 +89,37 @@ Two optional helpers are available from `credences`:
 `top_label_weights(measurement)` gives equal counting weights to tied winners,
 not their credences.
 
-The current parity test drives these primitives with a test-only selected-path
-adapter. It does not yet verify a production trie or backend. The next small
-implementation step is the selector, trie, and branch readout plan, wiring that
-same independent reference into production-trie parity tests.
+## Implemented candidate-path selection and trie plans
+
+The internal `credences.trie` module consumes already-encoded paths and supplied
+scores. It does not tokenize strings or call a model.
+
+1. Each candidate has named `bare` and `spaced` complete paths. Preflight checks
+   both, rejecting cross-label path collisions and possible stopping boundaries
+   without a usable, disjoint END set. One candidate's own alternatives never
+   coexist and do not create stopping decisions.
+2. The initial readout covers every distinct first token of both forms.
+   Selection keeps the entire higher-scoring path, with bare preferred on exact
+   ties, including `-inf` ties. It does not compare whole-answer likelihoods or
+   add a probability for choosing a form.
+3. The selected trie merges shared prefixes and compiles branching readouts.
+   Forced transitions and leaves need no scores. A terminal with children
+   includes every distinct END id alongside continuation ids.
+4. Scoring reuses initial scores at the selected root. Later readouts need the
+   unchanged context plus their complete continuation prefix, including forced
+   tokens. The plan combines branch log probabilities into candidate log
+   credences without label-level renormalization.
+
+For example, selected paths `[pos, itive]` and `[pos, it, ion]` share a forced
+`pos` prefix. There is one later comparison between `itive` and `it`; the final
+`ion` is forced. Selecting single-token spaced forms instead removes that later
+branch. These pieces illustrate structure, not a particular tokenizer.
+
+A plan owns immutable paths, END ids, and readout requests—not scores, prompts,
+or model state. It can be reused for identical ordered selected paths and END,
+but form selection must still run again for each measurement. No plan cache is
+implemented yet. The production selector and trie now pass the independent
+chain-rule reference tests; real tokenization and model execution remain next.
 
 ## Design documents
 
