@@ -29,6 +29,24 @@ uv run pytest
 uv build
 ```
 
+### Original checkout and isolated development
+
+Delta development stays in an isolated checkout. The original project folder
+tracks GitHub's `main` as a clean review/run copy and is synchronized after each
+completed publishing step passes CI. This is an explicit Git update, not a
+background filesystem mirror.
+
+For changes published elsewhere, run this in the original project folder:
+
+```bash
+git pull --ff-only
+```
+
+Keep development edits in the isolated checkout. If the original folder has
+local changes or diverges, resolve them deliberately rather than resetting or
+forcing an update. Its local-only `backup/original-scaffold` branch preserves
+the files present before the initial synchronization.
+
 The `dev` group includes pytest, Hypothesis, Ruff, and import-linter. The package
 has no runtime dependencies yet; model and DataFrame integrations will be optional
 extras as they are implemented. No model weights are needed for the pure core.

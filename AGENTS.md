@@ -136,6 +136,31 @@ uv run lint-imports                         # dependency-tier check
 uv build                                   # build the library distribution
 ```
 
+## Publishing and primary-checkout synchronization
+
+Keep development isolated in the thread checkout. The user's original checkout
+is a clean review/run copy of the published `main` branch.
+
+At a completed parent-thread step:
+
+1. Validate locally, commit, and push `main` to the configured GitHub upstream.
+   Inspect remotes first; `local` is the primary-checkout backlink, not GitHub.
+2. Verify GitHub CI passed for the exact published commit before updating the
+   original checkout.
+3. Resolve the original checkout from `local` and verify it is the intended
+   checkout on this machine, on `main`, with no tracked or untracked changes.
+   Stop and report if the target is unexpected, dirty, missing, or divergent.
+4. Fast-forward it to the published commit using the configured `local` remote
+   or an ordinary GitHub fetch/fast-forward. Never force-push, reset away edits,
+   or copy/delete files to make synchronization succeed.
+5. Refresh its `origin/main` reference and verify the thread, GitHub `main`, and
+   original `main` all match. Preserve ignored local files and backup branches;
+   do not publish local-only backups.
+
+Worker and review subagents do not publish or synchronize the primary checkout
+unless explicitly assigned that task. This is a publishing routine, not a
+background watcher for pushes made elsewhere.
+
 ## Source-of-truth hierarchy
 
 1. Code + tests define behavior.
