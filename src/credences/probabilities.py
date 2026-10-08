@@ -28,18 +28,22 @@ class RawReadout:
     informative even when its ordinary probability underflows to zero; ``-inf``
     means exact zero mass.
 
-    ``scored_token_ids`` maps each candidate to its selected complete continuation.
+    ``scored_token_ids`` maps each candidate answer string to the token IDs of its
+    selected complete continuation, which may be the bare or leading-space form.
+    IDs identify entries in the model's vocabulary, not individual characters.
     ``context_token_count`` is the length of the fixed prompt context. Paths
     exclude that context; discarded alternatives and branch scores are not stored.
 
-    A multi-token selected answer keeps its whole path, excluding context:
+    Suppose an illustrative tokenizer encodes ``"very positive"`` as two pieces:
+    ``"very"`` (ID 10) and ``" positive"`` (ID 11), while ``"negative"`` is one
+    token (ID 20). If these bare forms are selected, the record contains:
 
     >>> raw = RawReadout(
-    ...     credence_logprobs={"A": math.log(0.75), "B": math.log(0.25)},
-    ...     scored_token_ids={"A": (10, 11), "B": (20,)},
+    ...     credence_logprobs={"very positive": math.log(0.75), "negative": math.log(0.25)},
+    ...     scored_token_ids={"very positive": (10, 11), "negative": (20,)},
     ...     context_token_count=7,
     ... )
-    >>> raw.scored_token_ids["A"]
+    >>> raw.scored_token_ids["very positive"]
     (10, 11)
     """
 
