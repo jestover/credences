@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Refocus API docstrings on purpose, context, input/output meaning, and usage.
+  Explain whitespace-dependent candidate tokenization, and keep non-obvious
+  implementation rationale in concise code comments instead.
 - Add small runnable examples to the core docstrings and a durable pure-core
   walkthrough covering selection, trie scoring, results, JSON, and ties.
   Run the examples as doctests in ordinary CI to prevent documentation drift.

@@ -91,6 +91,11 @@ approximate silently.
   documentation. Docstrings, code comments, and test explanations must describe
   behavior directly; do not cite `SPEC.md`, `DECISIONS.md`, or `PLAN.md`. References
   to durable package documentation or other code are fine.
+- Docstrings target API users: explain what an object or operation is for, why
+  it is useful, what inputs/outputs mean, and how to use it. Examples should show
+  representative usage, not demonstrate constructor or loop mechanics.
+  Non-obvious implementation rationale belongs in sparse code comments; avoid
+  line-by-line narration and comment tutorials.
 - Include small runnable examples for non-obvious core behavior, and a shared
   walkthrough when several objects interact. Keep examples checked by the normal
   test run so they stay useful as the code evolves. Round display output only.

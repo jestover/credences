@@ -13,6 +13,24 @@ the examples in the core docstrings, so they cannot quietly drift from the code.
 
 ## 1. From two forms per candidate to a scored trie
 
+### Why keep two token paths?
+
+Leading spaces can change how a tokenizer represents an answer. A hypothetical
+tokenizer might split `"positive"` into `"pos"`, `"it"`, and `"ive"` with IDs
+`[973, 184, 1784]`, while encoding `" positive"` as one token `[17384]`. The two
+forms can therefore differ in both length and token IDs, not just their first
+piece.
+
+`CandidatePaths` holds both complete encodings: `bare` is the literal candidate
+text, and `spaced` is that text with one additional ASCII space in front. Both
+continue the same fixed prompt context; existing context whitespace is not
+removed. The model's first-token logits determine which form is selected for
+each candidate. This is a representation choice, not a comparison of complete
+answer likelihoods. The class stores supplied encodings; it does not tokenize
+text itself.
+
+### A small example
+
 For illustration, let `10` represent `"up"`, `11` represent `"war"`, `12`
 represent `"d"`, and `20` represent `"down"`. The spaced forms use single IDs
 `30`, `31`, and `40`. END IDs `99` and `100` both mean stopping.

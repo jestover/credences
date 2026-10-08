@@ -1,9 +1,27 @@
-"""Pure selection, path validation, and immutable token-trie readout plans.
+"""Measure forced-choice credences from encoded answers and supplied logits.
 
-The caller supplies already-encoded paths and score readouts. This module
-does not tokenize text, query a model, generate answers, or retain scores.
-Supported scores are finite float32-range logits or -inf, carried as Python
-floats. Probability arithmetic and path accumulation use higher precision.
+Use CandidatePaths for each candidate's two encoded continuations, validate
+them before inference, and request first_token_ids at the fixed context.
+select_paths chooses one complete form per candidate; build_trie then tells
+you which further scores are needed to distinguish the selected answers.
+TriePlan.score returns their natural-log credences.
+
+The caller owns tokenization and model calls. This module does no inference,
+generation, or caching. Scores must be finite float32-range logits or -inf,
+supplied as Python floats; probability calculations use higher precision.
+
+>>> forms = {
+...     "yes": CandidatePaths((10,), (30,)),
+...     "no": CandidatePaths((20,), (40,)),
+... }
+>>> validate_potential_paths(forms)
+>>> first_token_ids(forms)
+(10, 20, 30, 40)
+>>> initial = {10: 2.0, 30: 1.0, 20: 2.0, 40: 1.0}
+>>> plan = build_trie(select_paths(forms, initial))
+>>> logs = plan.score({(): initial})
+>>> {label: round(math.exp(value), 3) for label, value in logs.items()}
+{'yes': 0.5, 'no': 0.5}
 """
 
 import math
@@ -18,42 +36,59 @@ type TokenPath = tuple[int, ...]
 
 @dataclass(frozen=True, init=False)
 class CandidatePaths:
-    """The named bare and one-additional-space paths for a single candidate.
+    """Supply the two complete encoded continuations for one candidate.
 
-    Each is one complete canonical continuation, not a first-token variant.
-    Both paths are nonempty and copied into immutable tuples. Their suffixes
-    may differ. Actual text encoding and surface checks belong to the caller.
+    A token path is the sequence of model token IDs representing an answer
+    after the fixed prompt context.
+    ``bare`` represents the exact candidate text; ``spaced`` represents one
+    additional ASCII space followed by that text. Whitespace changes
+    tokenization: the two forms can have entirely different token IDs,
+    lengths, and suffixes, not just different first tokens.
 
-    >>> bare, spaced = [10, 11, 12], [31]
-    >>> paths = CandidatePaths(bare, spaced)
-    >>> bare.append(13)
-    >>> spaced[0] = 32
-    >>> paths.bare, paths.spaced
-    ((10, 11, 12), (31,))
+    The caller encodes both whole forms after the same fixed context and
+    checks their decoded text. This class does not tokenize or change the
+    context; existing context spaces stay in place. select_paths compares
+    first-token logits to choose one complete form, preferring bare on ties.
+    It does not maximize whole-answer likelihood.
+
+    For illustration, a tokenizer might split ``"positive"`` into ``"pos"``,
+    ``"it"``, and ``"ive"`` with IDs [973, 184, 1784], while encoding
+    ``" positive"`` as one token [17384]. These are invented vocabulary entries:
+
+    >>> forms = {
+    ...     "positive": CandidatePaths((973, 184, 1784), (17384,)),
+    ...     "negative": CandidatePaths((42, 43), (84,)),
+    ... }
+    >>> select_paths(forms, {973: 1.0, 17384: 2.0, 42: 2.0, 84: 1.0})
+    {'positive': (17384,), 'negative': (42, 43)}
     """
 
     bare: TokenPath
     spaced: TokenPath
 
     def __init__(self, bare: Sequence[int], spaced: Sequence[int]) -> None:
+        # Validate nonempty token-ID sequences and copy them so caller edits
+        # cannot change the continuations held by this frozen object.
         object.__setattr__(self, "bare", _token_path(bare))
         object.__setattr__(self, "spaced", _token_path(spaced))
 
 
 @dataclass(frozen=True)
 class ReadoutRequest:
-    """Required token logits after a prefix of a selected continuation.
+    """Describe which next-token logits to request and where to request them.
 
-    The caller appends prefix to the unchanged context before requesting the
-    distinct wanted ids. An empty prefix means the selected root; its scores
-    are reused from the initial form-selection readout.
+    Append ``prefix`` to the unchanged fixed context, then request every
+    token ID in ``wanted`` there. Prefixes are continuation tokens, not full
+    contexts. ``wanted`` may include stopping tokens (END) as well as answer
+    tokens. Supply all requested scores to the plan, not only a top-K subset.
+
+    Plans use ``prefix=()`` for a root branch, whose scores can be reused from
+    the initial form-selection readout.
 
     >>> context = (7, 8)
     >>> request = ReadoutRequest(prefix=(10,), wanted=(11, 99, 100))
     >>> context + request.prefix, request.wanted
     ((7, 8, 10), (11, 99, 100))
-    >>> context
-    (7, 8)
     """
 
     prefix: TokenPath
@@ -62,21 +97,23 @@ class ReadoutRequest:
 
 @dataclass(frozen=True)
 class TriePlan:
-    """A selected trie projected onto only its branching readouts.
+    """An immutable readout plan for scoring already-selected answer paths.
 
-    Build with build_trie. Paths preserve candidate order and are immutable;
-    readouts use deterministic parent-first prefix order. Forced transitions
-    and leaves need no readout, but their tokens remain in complete paths and
-    in prefixes of later requests. The plan contains no context or scores.
+    Obtain a plan with build_trie, supply the scores requested by ``readouts``,
+    and call score for natural-log credences. ``paths`` retains the complete
+    selected continuations in candidate order; ``end_tokens`` holds the
+    stopping-token set (END).
+
+    Readouts are in deterministic parent-first prefix order. Singleton
+    transitions are forced with probability 1, and leaves stop without an
+    END readout. Neither needs a query, but forced tokens remain in the
+    prefixes used for later requests. Plans contain no context, scores, or
+    model state and perform no inference or caching.
 
     >>> plan = build_trie({"up": (10,), "down": (20,)})
-    >>> plan.paths
-    (('up', (10,)), ('down', (20,)))
-    >>> plan.readouts
-    (ReadoutRequest(prefix=(), wanted=(10, 20)),)
     >>> logs = plan.score({(): {10: 2.0, 20: 2.0}})
-    >>> [round(math.exp(value), 3) for value in logs.values()]
-    [0.5, 0.5]
+    >>> {label: round(math.exp(value), 3) for label, value in logs.items()}
+    {'up': 0.5, 'down': 0.5}
     """
 
     paths: tuple[tuple[str, TokenPath], ...]
@@ -85,45 +122,54 @@ class TriePlan:
 
     @property
     def additional_readouts(self) -> tuple[ReadoutRequest, ...]:
-        """Non-root branches needing scores after the initial selection readout.
+        """Return the requests still needed after the first-token readout.
+
+        These are non-root branches only: request each at the fixed context
+        plus its prefix. Reuse initial scores for any root request instead
+        of querying the root again.
 
         >>> plan = build_trie(
         ...     {"up": (10,), "upward": (10, 11, 12), "down": (20,)},
         ...     end_tokens=(99, 100),
         ... )
-        >>> [request.prefix for request in plan.readouts]
-        [(), (10,)]
-        >>> plan.additional_readouts
-        (ReadoutRequest(prefix=(10,), wanted=(11, 99, 100)),)
+        >>> context = (7, 8)
+        >>> request, = plan.additional_readouts
+        >>> context + request.prefix, request.wanted
+        ((7, 8, 10), (11, 99, 100))
         """
         return tuple(request for request in self.readouts if request.prefix)
 
     def score(self, readouts: Mapping[TokenPath, Mapping[int, float]]) -> dict[str, float]:
-        """Return natural-log credences from all required branch readouts.
+        """Return a candidate-to-natural-log-credence mapping in candidate order.
 
-        Keys are continuation prefixes, not full contexts. Reuse the initial
-        form scores under () when the selected root branches. Every requested
-        branch and token must be present and valid, even at zero incoming mass.
-        Extra contexts or tokens are ignored. Forced steps contribute zero;
-        a terminal with children adds the grouped END event. No label-level
-        renormalization, model calls, or cross-call state is introduced.
+        Supply ``readouts[prefix][token_id]`` for every request in the plan.
+        Keys are continuation prefixes, not the full contexts used to query
+        the model. Reuse initial form-selection scores under ``()`` if the
+        selected root branches. Missing or invalid requested scores raise
+        BackendReadoutError, even on zero-probability paths; extras are ignored.
 
-        Illustrative ids only: the root splits equally between 10 and 20.
-        At (10,), two END ids give stopping mass 2/3 and continuation mass
-        1/3. The final token 12 is forced and needs no score.
+        Each branch normalizes over its distinct allowed token IDs; all -inf
+        scores give a uniform token distribution. Singleton steps are forced.
+        Where one answer ends and another continues, probabilities of all END
+        stopping tokens are summed for the shorter answer. Leaves need no END
+        scores. The resulting credences sum to 1 without label-level
+        renormalization. Exact zero credence is returned as -inf; finite logs
+        remain useful even when exponentiation underflows.
 
-        >>> forms = {
-        ...     "up": CandidatePaths((10,), (30,)),
-        ...     "upward": CandidatePaths((10, 11, 12), (31,)),
-        ...     "down": CandidatePaths((20,), (40,)),
-        ... }
-        >>> validate_potential_paths(forms, end_tokens=(99, 100))
-        >>> initial = {10: 2.0, 20: 2.0, 30: 1.0, 31: 0.0, 40: 1.0}
-        >>> selected = select_paths(forms, initial)
-        >>> plan = build_trie(selected, end_tokens=(99, 100))
-        >>> logs = plan.score({(): initial, (10,): {11: 0.0, 99: 0.0, 100: 0.0}})
-        >>> {label: round(math.exp(value), 6) for label, value in logs.items()}
-        {'up': 0.333333, 'upward': 0.166667, 'down': 0.5}
+        This uses supplied scores only, without inference or cached state.
+        Here equal stopping and continuation logits favor stopping 2:1
+        because END contains two distinct tokens:
+
+        >>> plan = build_trie(
+        ...     {"up": (10,), "upward": (10, 11, 12), "down": (20,)},
+        ...     end_tokens=(99, 100),
+        ... )
+        >>> logs = plan.score({
+        ...     (): {10: 2.0, 20: 2.0},
+        ...     (10,): {11: 0.0, 99: 0.0, 100: 0.0},
+        ... })
+        >>> {label: round(math.exp(value), 3) for label, value in logs.items()}
+        {'up': 0.333, 'upward': 0.167, 'down': 0.5}
         """
         transitions = {}
         for request in self.readouts:
@@ -153,10 +199,12 @@ class TriePlan:
 
 
 def first_token_ids(forms: Mapping[str, CandidatePaths]) -> tuple[int, ...]:
-    """Distinct first ids of both complete forms, in deterministic sorted order.
+    """Return the sorted token IDs to request for choosing candidate forms.
 
-    Validate candidate/path ownership without reading scores. Stopping
-    boundaries additionally require validate_potential_paths before inference.
+    Request these distinct first tokens once at the unchanged fixed context,
+    then pass their logits to select_paths. Shared first tokens appear only
+    once. This checks labels and path ownership, but use
+    validate_potential_paths before inference to check stopping boundaries too.
 
     >>> forms = {
     ...     "up": CandidatePaths((10,), (30,)),
@@ -173,12 +221,17 @@ def first_token_ids(forms: Mapping[str, CandidatePaths]) -> tuple[int, ...]:
 def select_paths(
     forms: Mapping[str, CandidatePaths], first_scores: Mapping[int, float]
 ) -> dict[str, TokenPath]:
-    """Select one entire path per candidate by its first-token logit.
+    """Choose one complete encoded continuation per candidate for scoring.
 
-    Choose spaced only when its score is strictly larger; exact finite or
-    -inf ties choose the named bare form. Validate every first score of both
-    forms, including discarded ones. Preserve candidate order and the chosen
-    complete suffix. Selection contributes no probability factor.
+    ``first_scores`` supplies logits for all first_token_ids at the same fixed
+    context. The higher first-token logit wins; exact ties, including -inf
+    ties, choose bare. The result preserves candidate order and the chosen
+    form's entire suffix, even when the two forms have different lengths.
+
+    This is not whole-answer-likelihood maximization and adds no probability
+    factor to later trie scoring. All first-token scores must be present and
+    valid, including those of discarded forms; otherwise BackendReadoutError
+    is raised. The caller obtains scores; this function does no inference.
 
     >>> forms = {
     ...     "upward": CandidatePaths((10, 11, 12), (31,)),
@@ -199,12 +252,18 @@ def select_paths(
 def validate_potential_paths(
     forms: Mapping[str, CandidatePaths], *, end_tokens: Iterable[int] = ()
 ) -> None:
-    """Preflight both forms before any score readout.
+    """Check that either form can safely be selected before requesting logits.
 
-    Reject cross-label path ownership collisions. A possible strict prefix
-    overlap across labels requires a nonempty END set disjoint from the next
-    continuation token. Relationships between one candidate's own forms do
-    not require END: those paths cannot coexist in the selected trie.
+    ``forms`` must contain at least two nonempty candidate labels. A complete
+    token path cannot belong to different labels. If one label's possible
+    path is a strict prefix of another's, ``end_tokens`` must supply stopping
+    tokens (END), distinct from the next continuation token at that boundary.
+    Otherwise stopping and continuing could not be distinguished.
+
+    Invalid labels, collisions, or unusable stopping boundaries raise
+    ValueError; valid inputs return None. Prefix relationships between one
+    candidate's own forms need no END because only one form will be selected.
+    This checks token paths, not whether they decode to the intended text.
 
     >>> forms = {
     ...     "up": CandidatePaths((10,), (30,)),
@@ -227,22 +286,33 @@ def validate_potential_paths(
 
 
 def build_trie(paths: Mapping[str, Sequence[int]], *, end_tokens: Iterable[int] = ()) -> TriePlan:
-    """Compile one selected complete path per candidate into a pure plan.
+    """Plan the readouts needed to distinguish selected candidate answers.
 
-    Merge shared prefixes before defining allowed-token sets. Reject empty or
-    cross-label identical paths. At a terminal with children, require usable
-    END ids and include each distinct id in that node's normalizer. Leaves
-    stop without end scores; singleton edges are forced. Copy all input data
-    into immutable plan fields, without caching or predicting future selection.
+    ``paths`` maps at least two nonempty candidate labels to one complete,
+    nonempty encoded continuation each, all after the same fixed context.
+    Use select_paths first when choosing between bare and spaced forms.
+    Shared prefixes share probability mass rather than counting once per label.
+
+    ``end_tokens`` supplies stopping tokens (END) when one answer is a strict
+    prefix of another. At such a boundary END must be nonempty and disjoint
+    from continuation IDs; every distinct stopping ID participates in scoring.
+    Empty or cross-label identical paths and unusable stopping boundaries
+    raise ValueError.
+
+    The returned immutable TriePlan preserves candidate order and requests
+    only branches. Singleton transitions have probability 1 without scores;
+    leaves stop without END scores. Forced tokens still belong in the context
+    plus prefix for later queries. Building a plan does no inference or caching.
+
+    Here the only later request distinguishes stopping at ``"up"`` from
+    continuing to ``"upward"``; the final token 12 needs no score:
 
     >>> plan = build_trie(
     ...     {"up": (10,), "upward": (10, 11, 12), "down": (20,)},
     ...     end_tokens=(99, 100),
     ... )
-    >>> [(request.prefix, request.wanted) for request in plan.readouts]
-    [((), (10, 20)), ((10,), (11, 99, 100))]
-    >>> (10, 11) not in {request.prefix for request in plan.readouts}
-    True
+    >>> plan.additional_readouts
+    (ReadoutRequest(prefix=(10,), wanted=(11, 99, 100)),)
     """
     _validate_labels(paths)
     selected = tuple((label, _token_path(path)) for label, path in paths.items())
@@ -276,15 +346,7 @@ def _possible_paths(forms: Mapping[str, CandidatePaths]) -> tuple[tuple[str, Tok
 
 
 def _path_owners(paths: Iterable[tuple[str, TokenPath]]) -> dict[TokenPath, str]:
-    """Allow repeated forms for one label, but reject cross-label ownership.
-
-    >>> _path_owners((("up", (10,)), ("up", (10,))))
-    {(10,): 'up'}
-    >>> _path_owners((("up", (10,)), ("down", (10,))))
-    Traceback (most recent call last):
-        ...
-    ValueError: Path (10,) is owned by both 'up' and 'down'
-    """
+    """Assign each path to one label, rejecting cross-label collisions."""
     owners = {}
     for label, path in paths:
         owner = owners.get(path)
@@ -318,25 +380,15 @@ def _token_ids(values: Iterable[int]) -> tuple[int, ...]:
 
 
 def _end_tokens(values: Iterable[int]) -> tuple[int, ...]:
-    """Canonicalize END ids so repeated ids cannot multiply stopping mass.
-
-    >>> _end_tokens([100, 99, 100])
-    (99, 100)
-    """
+    """Return validated, sorted, distinct stopping-token IDs."""
+    # Duplicate END IDs must not multiply stopping probability.
     return tuple(sorted(set(_token_ids(values))))
 
 
 def _validate_stopping_boundary(
     prefix: TokenPath, continuations: Iterable[int], end_tokens: tuple[int, ...]
 ) -> None:
-    """Keep stopping ids disjoint from the same node's continuation ids.
-
-    >>> _validate_stopping_boundary((10,), (11,), (99, 100))
-    >>> _validate_stopping_boundary((10,), (11,), (11, 99))
-    Traceback (most recent call last):
-        ...
-    ValueError: END overlaps continuation tokens [11] at prefix (10,)
-    """
+    """Require stopping tokens distinct from continuations at this prefix."""
     if not end_tokens:
         raise ValueError(f"Prefix {prefix} needs a nonempty END set")
     overlap = set(end_tokens).intersection(continuations)

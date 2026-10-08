@@ -12,6 +12,8 @@ measurement API are not implemented yet.
 Start with [small examples of the pure core](docs/pure-core.md): candidate paths
 through selection and trie scoring, result construction, JSON, ties, and
 numerical edge cases. Core docstrings also contain small runnable examples.
+They explain API purpose and usage; the walkthrough connects multiple objects,
+and sparse code comments explain non-obvious implementation choices.
 The normal test command checks both, alongside the behavioral tests.
 
 ## Development setup
