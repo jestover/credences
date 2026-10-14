@@ -92,9 +92,12 @@ approximate silently.
   behavior directly; do not cite `SPEC.md`, `DECISIONS.md`, or `PLAN.md`. References
   to durable package documentation or other code are fine.
 - Use **Google-style docstrings** with `Args`, `Returns`/`Yields`, `Raises`,
-  `Attributes`, and `Examples` sections where applicable. They target API users:
-  explain purpose, input/output meaning, and representative usage, not constructor
-  or loop mechanics. Types live in annotations; prose adds semantics and constraints.
+  `Attributes`, and `Examples` sections where applicable. They target API users
+  who have never read this file or `SPEC.md`: plain words, terms defined on
+  first use, no internal shorthand (see "Write documentation for a newcomer" in
+  `docs/style.md`). Explain purpose, input/output meaning, and representative
+  usage, not constructor or loop mechanics. The README follows the same rule;
+  contributor process stays here. Types live in annotations; prose adds semantics and constraints.
   Non-obvious implementation rationale belongs in sparse code comments; avoid
   line-by-line narration and comment tutorials.
 - Include small runnable examples for non-obvious core behavior, and a shared
@@ -179,6 +182,10 @@ At a completed parent-thread step:
 5. Refresh its `origin/main` reference and verify the thread, GitHub `main`, and
    original `main` all match. Preserve ignored local files and backup branches;
    do not publish local-only backups.
+
+For changes published from elsewhere, the original checkout updates with
+`git pull --ff-only`. Its local-only `backup/original-scaffold` branch preserves
+the files present before the initial synchronization.
 
 Worker and review subagents do not publish or synchronize the primary checkout
 unless explicitly assigned that task. This is a publishing routine, not a

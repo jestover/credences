@@ -18,6 +18,29 @@ coding guide.
 - Use modern Python syntax appropriate for Python 3.14. Do not rewrite clear
   numerical code merely to shorten it.
 
+## Write documentation for a newcomer
+
+Docstrings, the README, and `docs/` are for someone using the package who
+has never seen this repository's design documents or history. Before
+finishing, reread the text as that person would. If they would need
+`SPEC.md` or knowledge of the code to follow it, rewrite it.
+
+- Say what the object or function does and when to use it, in plain words,
+  before any edge cases.
+- Define project terms on first use, or use the module docstring's
+  definitions: logit, log probability, credence, token path, bare and spaced
+  encodings, END tokens. Avoid internal shorthand such as "root",
+  "branch", "leaf", "forced", "readout", "fixed context", "mass", or
+  "renormalization" unless the text explains it.
+- State each rule once, as what is required or what happens ("Scores must be
+  real numbers or `-inf`"). Avoid stacking negatives that guard against
+  misreadings a user would not make.
+- Leave out guarantees that only matter to maintainers, such as which step
+  does no caching or which internal structure is not stored. Put that in code
+  comments or tests.
+- Introduce an example in the `Examples:` section, not with a sentence that
+  ends in a colon just before `Args:`.
+
 ## Google-style docstrings
 
 Start with what the object or operation is for. Explain domain terms and why the

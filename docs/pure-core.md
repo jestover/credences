@@ -1,15 +1,15 @@
 # Small examples of the pure measurement core
 
 These examples use **invented token IDs and logits**, not a real tokenizer or
-model. They show the internal building blocks; the model-backed measurement API
-is not implemented yet. Run the snippets on this page in order.
+model. They show the lower-level building blocks that the planned model-backed
+API will run for you; that API is not implemented yet. Run the snippets on this
+page in order.
 
 `>>>` and `...` mark interactive Python input; unprefixed lines are expected
 output. To turn a snippet into a script, remove the prompts and output lines.
 
-Outputs are rounded only for readability. The library preserves unrounded
-values and natural-log credences. `uv run pytest` executes this walkthrough and
-the examples in the core docstrings, so they cannot quietly drift from the code.
+Outputs are rounded here only for readability; the library itself never rounds.
+`uv run pytest` runs every example on this page, so they stay in step with the code.
 
 ## 1. From two forms per candidate to a scored trie
 
@@ -21,13 +21,12 @@ tokenizer might split `"positive"` into `"pos"`, `"it"`, and `"ive"` with IDs
 forms can therefore differ in both length and token IDs, not just their first
 piece.
 
-`CandidatePaths` holds both complete encodings: `bare` is the literal candidate
-text, and `spaced` is that text with one additional ASCII space in front. Both
-continue the same fixed prompt context; existing context whitespace is not
-removed. The model's first-token logits determine which form is selected for
-each candidate. This is a representation choice, not a comparison of complete
-answer likelihoods. The class stores supplied encodings; it does not tokenize
-text itself.
+`CandidatePaths` holds both encodings: `bare` is the answer exactly as
+written, and `spaced` is the answer with one space in front. Encode both as
+they would appear right after the prompt. For each answer, the model's
+first-token logits decide which version is scored. That choice only decides how
+the answer is represented; it does not change the answer's probability. The
+class stores token IDs you supply; it does not tokenize text.
 
 ### A small example
 
@@ -51,11 +50,12 @@ represent `"d"`, and `20` represent `"down"`. The spaced forms use single IDs
 
 ```
 
-The constructor validates IDs and stores immutable tuples. It does not verify
-that those IDs decode to the stated strings; that requires a tokenizer.
+The IDs are stored as tuples. Nothing checks that they spell the intended
+words; that needs a tokenizer.
 
-Before asking for scores, preflight **both** forms. The bare `"up"` path ends
-where the bare `"upward"` path continues, so usable END IDs are required.
+Before asking the model for anything, check **both** encodings of every answer.
+The bare `"up"` path ends where the bare `"upward"` path continues, so the
+model must be able to signal "stop" with END tokens, here IDs `99` and `100`.
 
 ```pycon
 >>> end_tokens = [100, 99, 99]
@@ -65,9 +65,9 @@ where the bare `"upward"` path continues, so usable END IDs are required.
 
 ```
 
-Six forms need only five distinct first-token scores: two share `10`.
-Suppose the caller's fixed token context is `C`. Initial logits are requested
-at `C`, without any candidate appended.
+Six encodings need only five first-token scores, because two start with `10`.
+Suppose your prompt encodes to the tokens `C`. Ask the model for its logits
+right after `C`, with no answer tokens added.
 
 ```pycon
 >>> C = (700, 701)
@@ -78,11 +78,11 @@ at `C`, without any candidate appended.
 
 ```
 
-These are **logits**, which may be positive. Bare wins each comparison here.
-Selection keeps the complete suffix and adds no probability factor. Exact
-form-score ties also choose bare.
+These are **logits** (raw scores), so they can be positive. Here the bare
+version wins for every answer. Each answer keeps its whole chosen encoding, and
+on an exact tie the bare version wins.
 
-Compile only the selected paths:
+Plan the scoring for the chosen paths:
 
 ```pycon
 >>> plan = build_trie(selected, end_tokens=end_tokens)
@@ -99,14 +99,16 @@ The plan contains **requests, not scores**:
 
 | Prefix | Decision |
 |---|---|
-| `()` | Choose `10` or `20`; `10` is counted once despite two labels sharing it |
+| `()` | Choose `10` or `20`; `10` starts both `"up"` and `"upward"` but is scored once |
 | `(10,)` | Continue with `11`, or stop with END `99` or `100` |
-| `(10, 11)` | Force `12`; no score needed |
+| `(10, 11)` | Only `12` is possible, so no score is needed |
 
-Leaves stop without another query. END IDs are deduplicated before normalization.
+An answer that no other answer continues needs no stopping score. Repeated END
+IDs count once.
 
-The root reuses the initial scores, so only the non-root branch needs another
-readout. Request it at the **unchanged context plus the full prefix**:
+The scores right after the prompt are already in hand, so only the request at
+`(10,)` needs another model call. Make it after the prompt **plus the full
+prefix**:
 
 ```pycon
 >>> [(C + request.prefix, request.wanted) for request in plan.additional_readouts]
@@ -121,28 +123,26 @@ readout. Request it at the **unchanged context plus the full prefix**:
 
 ```
 
-`plan.readouts` describes where comparisons are needed. The `readouts` argument
-supplies the actual logits at those positions; its keys are prefixes relative
-to `C`, not full contexts.
+`plan.readouts` says where scores are needed. The `readouts` argument to
+`score` supplies them, keyed by the prefix after the prompt (not including `C`).
 
-Inside scoring, each branch becomes a dictionary of token log probabilities.
-The method then collects only the contributions belonging to each label:
+Each label's probability is the product of the steps along its path:
 
 | Label | Probability calculation |
 |---|---|
-| `"up"` | Root weight `1/2` times grouped stopping probability `2/3` |
-| `"upward"` | Root weight `1/2` times continuation probability `1/3`; final `12` is forced |
-| `"down"` | Root weight `1/2`; the path is a leaf |
+| `"up"` | First token `1/2` times stopping probability (either END token) `2/3` |
+| `"upward"` | First token `1/2` times continuing probability `1/3`; the last step, `12`, has probability 1 |
+| `"down"` | First token `1/2`; nothing else starts with `20` |
 
-The method adds logs rather than multiplying probabilities. Final probabilities
-already sum to 1; there is no label-level renormalization. A plan contains no
-prompt or score state and can score new readouts independently.
+`score` adds log probabilities, which is the same as multiplying
+probabilities. The results already sum to 1, with no rescaling. A plan stores
+no prompt or scores, so you can reuse it for another prompt whenever
+`select_paths` chooses the same paths.
 
 ## 2. From log credences to results and JSON
 
-Continue with `logs`, `plan`, and `C` from the first section. The raw result records
-selected complete paths and the length of the fixed context—not the request
-plan, discarded alternatives, or a generated inference trace.
+Continue with `logs`, `plan`, and `C` from the first section. The raw result
+records the token path scored for each label and the number of prompt tokens.
 
 ```pycon
 >>> from credences import RawReadout
@@ -158,10 +158,10 @@ plan, discarded alternatives, or a generated inference trace.
 
 ```
 
-The result builder checks that the log credences imply normalized mass. It
-derives the vector and summaries without rounding or renormalizing the vector.
+`measurement_from_raw` checks that the credences sum to 1 and then computes
+the summaries. It never rescales or rounds the credences.
 
-`to_dict()` makes a detached, JSON-safe snapshot:
+`to_dict()` returns a copy you can save as JSON:
 
 ```pycon
 >>> import json
@@ -174,9 +174,8 @@ derives the vector and summaries without rounding or renormalizing the vector.
 
 ```
 
-The result dataclasses prevent field reassignment, but their dictionaries remain
-mutable. The result builder copies input mappings so edits to the original raw
-object do not invalidate already-computed summaries:
+A measurement keeps its own copy of its inputs, so later changes to the
+`RawReadout` do not affect it:
 
 ```pycon
 >>> saved_down_log = result.raw.credence_logprobs["down"]
@@ -186,13 +185,14 @@ True
 
 ```
 
-The original raw object shares the supplied `logs` dictionary, so that original
-dictionary changes too. The measurement owns a separate snapshot.
+`RawReadout` itself does not copy, so `raw.credence_logprobs` and `logs` are
+the same dictionary; that edit changed `logs` too.
 
 ## 3. Exact ties and caller-owned randomness
 
-Here both winning labels have identical log credences. Counting weights split
-one winner-count equally; they are not the original candidate probabilities.
+Here two labels tie for the highest credence. `top_label_weights` splits one
+win equally between them, which is useful for counting winners across many
+measurements. These weights are not credences.
 
 ```pycon
 >>> from credences import choose_top_label, top_label_weights
@@ -211,14 +211,14 @@ True
 
 ```
 
-The package does not select a winner during measurement. The optional helper
-uses the supplied RNG, not global randomness, and does not alter the result.
+Measurements never break ties themselves. `choose_top_label` uses only the
+generator you pass, so a seeded generator makes the choice reproducible.
 
 ## 4. Numerical rules worth remembering
 
-Logits are unnormalized scores. Normalized log probabilities are <= 0.
-The branch helper returns logs; exponentiate only when ordinary probabilities
-are needed.
+Logits are raw scores and can be any real number; log probabilities are at
+most 0. `masked_logprobs`, which scores a single step, returns log
+probabilities; exponentiate them to get ordinary probabilities.
 
 ```pycon
 >>> from credences.probabilities import masked_logprobs
@@ -233,11 +233,13 @@ are needed.
 
 ```
 
-All-`-inf` fallback is uniform over **distinct tokens**, not final labels.
-Missing requested scores, NaN, and positive infinity remain errors.
+When every allowed token scores `-inf`, the tokens share the probability
+equally. That is equal per **token**, not per answer: answers that start with
+the same token split that token's share. A missing score, NaN, or +inf raises
+`BackendReadoutError`.
 
-Very small probabilities can underflow, but their finite log credences remain
-distinct from exact zero:
+A very small probability can round to 0.0, but its log credence stays finite,
+so it remains distinct from an answer with exactly zero probability:
 
 ```pycon
 >>> tiny = measurement_from_raw(RawReadout(
@@ -251,5 +253,6 @@ distinct from exact zero:
 
 ```
 
-Finite logs stay finite in JSON; only exact-zero logs become `null`. Winning
-labels are determined from exact computed log values, not rounded probabilities.
+In JSON, only exactly-zero log credences become `null`. Winners are found by
+comparing exact log credences, so two answers whose probabilities happen to
+round to the same float are not reported as tied.

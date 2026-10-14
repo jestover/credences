@@ -18,9 +18,10 @@ def test_core_docstring_examples_execute_without_drift(module):
     assert result.failed == 0
 
 
-def test_pure_core_walkthrough_executes_without_drift():
-    path = Path(__file__).resolve().parents[1] / "docs" / "pure-core.md"
+@pytest.mark.parametrize("relative_path", ["README.md", "docs/pure-core.md"])
+def test_markdown_examples_execute_without_drift(relative_path):
+    path = Path(__file__).resolve().parents[1] / relative_path
     result = doctest.testfile(str(path), module_relative=False)
 
-    assert result.attempted > 0, "No walkthrough examples were discovered"
+    assert result.attempted > 0, "No Markdown examples were discovered"
     assert result.failed == 0

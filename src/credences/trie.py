@@ -1,16 +1,35 @@
-"""Measure forced-choice credences from encoded answers and supplied logits.
+"""Score multi-token candidate answers using a model's next-token logits.
 
-Use CandidatePaths for each candidate's two encoded continuations, validate
-them before inference, and request first_token_ids at the fixed context.
-select_paths chooses one complete form per candidate; build_trie then tells
-you which further scores are needed to distinguish the selected answers.
-TriePlan.score returns their natural-log credences.
+A language model predicts one token at a time, but a candidate answer can be
+several tokens long, and different candidates can start with the same token.
+This module works out which next-token scores you need from the model, then
+combines them into one credence for each candidate.
 
-The caller owns tokenization and model calls. This module does no inference,
-generation, or caching. Scores must be finite float32-range logits or -inf,
-supplied as Python floats; probability calculations use higher precision.
+You supply the token IDs for each candidate and get the logits from your
+model; this module does no tokenization and never calls a model. The steps
+are:
+
+1. Put each candidate's two encodings (with and without a leading space) in
+   a CandidatePaths, and call validate_potential_paths to catch problems
+   before running the model.
+2. Get the model's logits for first_token_ids(forms), right after the prompt.
+3. Call select_paths to choose which encoding to score for each candidate.
+4. Call build_trie on the chosen encodings. For each request in the returned
+   plan's ``additional_readouts``, get logits from the model.
+5. Call the plan's score method to get each candidate's natural-log credence.
+
+Two terms come up throughout. A *token path* is the sequence of token IDs for
+one answer, as it would appear right after the prompt. *END tokens* are the
+token IDs that mean an answer has finished, such as the model's end-of-turn
+token. They are needed when one candidate is the start of another, as
+``"up"`` is of ``"upward"``: after ``"up"``, the model chooses between
+stopping and continuing.
+
+Logits should be Python floats, and ``-inf`` means the token is impossible.
 
 Examples:
+    Two one-token candidates, with made-up token IDs and logits:
+
     >>> forms = {
     ...     "yes": CandidatePaths((10,), (30,)),
     ...     "no": CandidatePaths((20,), (40,)),
@@ -37,33 +56,29 @@ type TokenPath = tuple[int, ...]
 
 @dataclass(frozen=True, init=False)
 class CandidatePaths:
-    """Tokenizations of the exact and additional-space forms of one answer.
+    """The two token encodings of one candidate answer.
 
-    A token path is the sequence of model token IDs representing an answer
-    after the fixed prompt context.
-    ``bare`` represents the exact candidate text; ``spaced`` represents one
-    additional ASCII space followed by that text. Whitespace changes
-    tokenization: the two forms can have entirely different token IDs,
-    lengths, and suffixes, not just different first tokens.
+    Tokenizers usually encode a word differently with and without a space in
+    front of it, and right after a prompt a model may prefer either one. So
+    each candidate is given in both versions: ``bare`` encodes the answer
+    exactly as written, and ``spaced`` encodes it with one space in front.
+    The two can differ in length and in every token, not just the first.
+    select_paths later picks which version to score.
 
-    The caller encodes both whole forms after the same fixed context and
-    checks their decoded text. This class does not tokenize or change the
-    context; existing context spaces stay in place. select_paths compares
-    first-token logits to choose one complete form, preferring bare on ties.
-    It does not maximize whole-answer likelihood.
-
-    For illustration, a tokenizer might split ``"positive"`` into ``"pos"``,
-    ``"it"``, and ``"ive"`` with IDs [973, 184, 1784], while encoding
-    ``" positive"`` as one token [17384]. These are invented vocabulary entries:
+    Encode each version as it would appear right after the prompt, and check
+    that it decodes back to the intended text. This class only stores the
+    token IDs; it cannot check what they spell.
 
     Attributes:
-        bare: Complete, nonempty token path for the exact candidate text.
-        spaced: Complete, nonempty token path for one additional ASCII space
-            followed by the candidate text.
+        bare: Token IDs for the answer exactly as written.
+        spaced: Token IDs for the answer with one space in front.
 
     Examples:
+        Suppose a tokenizer splits ``"positive"`` into three tokens but encodes
+        ``" positive"`` as one token. The IDs and logits are made up.
+
         >>> forms = {
-        ...     "positive": CandidatePaths((973, 184, 1784), (17384,)),
+        ...     "positive": CandidatePaths((973, 184, 207), (17384,)),
         ...     "negative": CandidatePaths((42, 43), (84,)),
         ... }
         >>> select_paths(forms, {973: 1.0, 17384: 2.0, 42: 2.0, 84: 1.0})
@@ -74,41 +89,40 @@ class CandidatePaths:
     spaced: TokenPath
 
     def __init__(self, bare: Sequence[int], spaced: Sequence[int]) -> None:
-        """Copy and validate both complete continuation paths.
+        """Store both encodings as tuples.
 
         Args:
-            bare: Token IDs for the exact candidate text.
-            spaced: Token IDs for the candidate text with one additional ASCII space.
+            bare: Token IDs for the answer exactly as written.
+            spaced: Token IDs for the answer with one space in front.
 
         Raises:
-            TypeError: A path is not a sequence of token IDs.
-            ValueError: A path is empty or contains IDs that are not nonnegative integers.
+            TypeError: An encoding is not a sequence of token IDs, for example a string.
+            ValueError: An encoding is empty or contains an ID that is not a
+                nonnegative integer.
         """
-        # Validate nonempty token-ID sequences and copy them so caller edits
-        # cannot change the continuations held by this frozen object.
+        # Copy into tuples so later edits to the caller's lists cannot change
+        # this frozen object.
         object.__setattr__(self, "bare", _token_path(bare))
         object.__setattr__(self, "spaced", _token_path(spaced))
 
 
 @dataclass(frozen=True)
 class ReadoutRequest:
-    """The tokens to score at a particular answer-continuation prefix.
+    """One set of next-token scores to get from the model.
 
-    Append ``prefix`` to the unchanged fixed context, then request every
-    token ID in ``wanted`` there. Prefixes are continuation tokens, not full
-    contexts. ``wanted`` may include stopping tokens (END) as well as answer
-    tokens. Supply all requested scores to the plan, not only a top-K subset.
-
-    Plans use ``prefix=()`` for a root branch, whose scores can be reused from
-    the initial form-selection readout.
+    Feed the model your prompt tokens followed by the tokens in ``prefix``,
+    and read its logits for every token ID in ``wanted``. A score is needed
+    for each one, not only for the model's highest-scoring tokens.
 
     Attributes:
-        prefix: Continuation tokens to append to the unchanged fixed context;
-            an empty prefix requests scores at the root.
-        wanted: Distinct token IDs whose logits must all be supplied at that prefix,
-            including any END tokens.
+        prefix: Answer tokens to add after the prompt. Empty means the scores
+            right after the prompt.
+        wanted: Token IDs whose logits are needed, including any END tokens.
 
     Examples:
+        With prompt tokens ``(7, 8)``, this request asks for the logits of
+        tokens 11, 99, and 100 after the input ``(7, 8, 10)``:
+
         >>> context = (7, 8)
         >>> request = ReadoutRequest(prefix=(10,), wanted=(11, 99, 100))
         >>> context + request.prefix, request.wanted
@@ -121,22 +135,22 @@ class ReadoutRequest:
 
 @dataclass(frozen=True)
 class TriePlan:
-    """An immutable plan for scoring selected candidate answers.
+    """The model scores needed to tell a set of candidate answers apart.
 
-    Obtain a plan with build_trie, supply the scores requested by ``readouts``,
-    and call score for natural-log credences.
+    Create a plan with build_trie, get the scores it asks for, and pass them
+    to score to get credences.
 
-    Readouts are in deterministic parent-first prefix order. Singleton
-    transitions are forced with probability 1, and leaves stop without an
-    END readout. Neither needs a query, but forced tokens remain in the
-    prefixes used for later requests. Plans contain no context, scores, or
-    model state and perform no inference or caching.
+    The plan only asks for scores where the candidates' token paths diverge.
+    Where only one next token is possible, that token has probability 1 and
+    needs no model call; it still appears in the prefixes of later requests.
+    A plan holds no prompt, scores, or model state, so the same plan can
+    score any prompt for which select_paths chose the same paths.
 
     Attributes:
-        paths: Candidate labels paired with their complete selected continuations,
-            in candidate order.
-        end_tokens: Sorted, distinct stopping-token IDs (END).
-        readouts: Branch requests in deterministic parent-first prefix order.
+        paths: Each candidate label with the token path being scored, in
+            candidate order.
+        end_tokens: Token IDs that mean an answer has finished, sorted, each once.
+        readouts: Every request for scores, shortest prefix first.
 
     Examples:
         >>> plan = build_trie({"up": (10,), "down": (20,)})
@@ -151,15 +165,14 @@ class TriePlan:
 
     @property
     def additional_readouts(self) -> tuple[ReadoutRequest, ...]:
-        """Non-root score requests still needed after the first-token readout.
+        """The requests still to send to the model after the first-token scores.
 
-        These are non-root branches only: request each at the fixed context
-        plus its prefix. Reuse initial scores for any root request instead
-        of querying the root again.
+        This is ``readouts`` without the request at the empty prefix. You
+        already have the scores right after the prompt from choosing paths, so
+        pass those to score under the key ``()`` instead of asking again.
 
         Returns:
-            Non-root branch requests, each to be queried at the fixed context plus
-            its continuation prefix.
+            The remaining requests, shortest prefix first.
 
         Examples:
             >>> plan = build_trie(
@@ -174,40 +187,36 @@ class TriePlan:
         return tuple(request for request in self.readouts if request.prefix)
 
     def score(self, readouts: Mapping[TokenPath, Mapping[int, float]]) -> dict[str, float]:
-        """Return a candidate-to-natural-log-credence mapping in candidate order.
+        """Combine the model's scores into a log credence for each candidate.
 
-        Supply ``readouts[prefix][token_id]`` for every request in the plan.
-        Keys are continuation prefixes, not the full contexts used to query
-        the model. Reuse initial form-selection scores under ``()`` if the
-        selected root branches. Every requested score is required, even on
-        zero-probability paths; extras are ignored.
-
-        Each branch normalizes over its distinct allowed token IDs; all -inf
-        scores give a uniform token distribution. Singleton steps are forced.
-        Where one answer ends and another continues, probabilities of all END
-        stopping tokens are summed for the shorter answer. Leaves need no END
-        scores. The resulting credences sum to 1 without label-level
-        renormalization. Exact zero credence is returned as -inf; finite logs
-        remain useful even when exponentiation underflows.
-
-        This uses supplied scores only, without inference or cached state.
-        Here equal stopping and continuation logits favor stopping 2:1
-        because END contains two distinct tokens:
+        A candidate's credence is the product of the probabilities of each
+        token along its path. At each step, the probabilities are computed
+        among only the tokens the candidates allow there (see
+        masked_logprobs). Where one candidate ends and another continues, the
+        shorter one's probability of stopping is the combined probability of
+        all END tokens. The credences sum to 1 with no extra rescaling.
 
         Args:
-            readouts: Next-token logits keyed by continuation prefix, then token ID.
-                Supply every requested score, using initial selection scores at
-                ``()`` when the selected root branches.
+            readouts: The model's logits for each request, keyed first by the
+                request's ``prefix`` and then by token ID. Use ``()`` for the
+                scores right after the prompt. Every requested score is needed,
+                even on paths that end up with zero probability; extra scores
+                are ignored.
 
         Returns:
-            Natural-log credences keyed by candidate label in candidate order.
-            Exact zero credence is represented by -inf.
+            Each candidate's natural-log credence, in candidate order. ``-inf``
+            means exactly zero probability.
 
         Raises:
-            BackendReadoutError: A requested branch or token score is missing, or a
-                requested score is invalid.
+            BackendReadoutError: A requested prefix or score is missing, or a
+                score is invalid.
 
         Examples:
+            ``"up"`` and ``"upward"`` share token 10. After it, the model
+            either continues with 11 or stops with END token 99 or 100. With
+            equal logits, stopping gets 2/3 of that probability because two
+            END tokens can stop it:
+
             >>> plan = build_trie(
             ...     {"up": (10,), "upward": (10, 11, 12), "down": (20,)},
             ...     end_tokens=(99, 100),
@@ -249,24 +258,24 @@ class TriePlan:
 
 
 def first_token_ids(forms: Mapping[str, CandidatePaths]) -> tuple[int, ...]:
-    """Return the sorted token IDs to request for choosing candidate forms.
+    """Return the token IDs whose scores you need right after the prompt.
 
-    Request these distinct first tokens once at the unchanged fixed context,
-    then pass their logits to select_paths. Shared first tokens appear only
-    once. This checks labels and path ownership, but use
-    validate_potential_paths before inference to check stopping boundaries too.
+    These are the first tokens of both encodings of every candidate, each
+    listed once. Get the model's logits for them and pass those to
+    select_paths. Call validate_potential_paths first: this function does not
+    check END tokens.
 
     Args:
-        forms: At least two nonempty candidate labels mapped to their named bare
-            and spaced continuation paths.
+        forms: Each candidate label mapped to its CandidatePaths. At least two
+            candidates are needed.
 
     Returns:
-        Sorted, distinct first-token IDs from both forms of every candidate.
+        The distinct first-token IDs, sorted.
 
     Raises:
-        TypeError: A candidate's forms are not supplied as CandidatePaths.
-        ValueError: Labels are invalid, fewer than two candidates are supplied,
-            or a complete path belongs to different labels.
+        TypeError: A candidate's encodings are not given as CandidatePaths.
+        ValueError: There are fewer than two candidates, a label is empty, or
+            two candidates share an identical token path.
 
     Examples:
         >>> forms = {
@@ -284,36 +293,34 @@ def first_token_ids(forms: Mapping[str, CandidatePaths]) -> tuple[int, ...]:
 def select_paths(
     forms: Mapping[str, CandidatePaths], first_scores: Mapping[int, float]
 ) -> dict[str, TokenPath]:
-    """Choose one complete encoded continuation per candidate for scoring.
+    """Choose which encoding, bare or spaced, to score for each candidate.
 
-    ``first_scores`` supplies logits for all first_token_ids at the same fixed
-    context. The higher first-token logit wins; exact ties, including -inf
-    ties, choose bare. The result preserves candidate order and the chosen
-    form's entire suffix, even when the two forms have different lengths.
-
-    This is not whole-answer-likelihood maximization and adds no probability
-    factor to later trie scoring. All first-token scores must be present and
-    valid, including those of discarded forms; otherwise BackendReadoutError
-    is raised. The caller obtains scores; this function does no inference.
+    Each candidate keeps the encoding whose first token has the higher logit
+    right after the prompt; on an exact tie, it keeps the bare one. The
+    chosen encoding is kept whole, whatever its length. The choice only
+    decides how each answer is represented. It does not change that answer's
+    probability.
 
     Args:
-        forms: At least two nonempty candidate labels mapped to their named bare
-            and spaced continuation paths.
-        first_scores: Logits for every distinct first token from both forms,
-            queried at the same unchanged fixed context.
+        forms: Each candidate label mapped to its CandidatePaths. At least two
+            candidates are needed.
+        first_scores: The model's logits right after the prompt, for every ID
+            from first_token_ids, including tokens of encodings that end up
+            not chosen.
 
     Returns:
-        Candidate labels mapped to their chosen complete paths in candidate order.
-        Exact first-token ties choose the bare form.
+        Each candidate label mapped to its chosen token path, in candidate order.
 
     Raises:
-        TypeError: A candidate's forms are not supplied as CandidatePaths.
-        ValueError: Labels are invalid, fewer than two candidates are supplied,
-            or a complete path belongs to different labels.
-        BackendReadoutError: Any required first-token score is missing or invalid,
-            including a score for a discarded form.
+        TypeError: A candidate's encodings are not given as CandidatePaths.
+        ValueError: There are fewer than two candidates, a label is empty, or
+            two candidates share an identical token path.
+        BackendReadoutError: A needed first-token score is missing or invalid.
 
     Examples:
+        ``"upward"`` has a three-token bare encoding and a one-token spaced
+        one. The spaced encoding wins only when its first token scores higher.
+
         >>> forms = {
         ...     "upward": CandidatePaths((10, 11, 12), (31,)),
         ...     "down": CandidatePaths((20,), (40,)),
@@ -333,29 +340,31 @@ def select_paths(
 def validate_potential_paths(
     forms: Mapping[str, CandidatePaths], *, end_tokens: Iterable[int] = ()
 ) -> None:
-    """Check that either form can safely be selected before requesting logits.
+    """Check the candidates' encodings for problems before you call the model.
 
-    ``forms`` must contain at least two nonempty candidate labels. A complete
-    token path cannot belong to different labels. If one label's possible
-    path is a strict prefix of another's, ``end_tokens`` must supply stopping
-    tokens (END), distinct from the next continuation token at that boundary.
-    Otherwise stopping and continuing could not be distinguished.
+    Either encoding of a candidate might be chosen later, so this checks
+    both. It raises if:
 
-    Prefix relationships between one candidate's own forms need no END because
-    only one form will be selected. This checks token paths, not whether they
-    decode to the intended text.
+    - there are fewer than two candidates, or a label is empty;
+    - two candidates have an identical token path;
+    - one candidate's path is the start of another candidate's path (as with
+      ``"up"`` and ``"upward"``) and no END tokens are given, or an END token
+      is also the token that continues the longer path. The model's choice to
+      stop must use different tokens from its choice to continue, or the two
+      cannot be told apart.
+
+    The two encodings of the same candidate may overlap freely, since only
+    one of them is scored. This does not check what the token IDs spell.
 
     Args:
-        forms: At least two nonempty candidate labels mapped to their named bare
-            and spaced continuation paths.
-        end_tokens: Nonnegative integer stopping-token IDs, required at
-            cross-label prefix boundaries and disjoint from continuations there.
-            Duplicates are ignored.
+        forms: Each candidate label mapped to its CandidatePaths.
+        end_tokens: Token IDs that mean an answer has finished. Needed only
+            when one candidate's path can be the start of another's.
 
     Raises:
-        TypeError: A candidate's forms are not supplied as CandidatePaths.
-        ValueError: Labels, path ownership, stopping-token IDs, or stopping
-            boundaries are invalid.
+        TypeError: A candidate's encodings are not given as CandidatePaths.
+        ValueError: One of the problems listed above, or an END token ID that
+            is not a nonnegative integer.
 
     Examples:
         >>> forms = {
@@ -379,43 +388,33 @@ def validate_potential_paths(
 
 
 def build_trie(paths: Mapping[str, Sequence[int]], *, end_tokens: Iterable[int] = ()) -> TriePlan:
-    """Plan the readouts needed to distinguish selected candidate answers.
+    """Plan which model scores are needed to score the chosen token paths.
 
-    ``paths`` maps at least two nonempty candidate labels to one complete,
-    nonempty encoded continuation each, all after the same fixed context.
-    Use select_paths first when choosing between bare and spaced forms.
-    Shared prefixes share probability mass rather than counting once per label.
-
-    ``end_tokens`` supplies stopping tokens (END) when one answer is a strict
-    prefix of another. At such a boundary END must be nonempty and disjoint
-    from continuation IDs; every distinct stopping ID participates in scoring.
-    Empty or cross-label identical paths and unusable stopping boundaries
-    raise ValueError.
-
-    The returned immutable TriePlan preserves candidate order and requests
-    only branches. Singleton transitions have probability 1 without scores;
-    leaves stop without END scores. Forced tokens still belong in the context
-    plus prefix for later queries. Building a plan does no inference or caching.
-
-    Here the only later request distinguishes stopping at ``"up"`` from
-    continuing to ``"upward"``; the final token 12 needs no score:
+    Usually ``paths`` is the result of select_paths. Candidates that start
+    with the same tokens share those steps, so the probability of a shared
+    start is counted once rather than once per candidate.
 
     Args:
-        paths: At least two nonempty candidate labels mapped to complete, nonempty
-            token-ID continuations after the same fixed context.
-        end_tokens: Nonnegative integer stopping-token IDs, required when one
-            selected path is a strict prefix of another. Duplicates are ignored.
+        paths: At least two candidate labels, each mapped to a nonempty token path.
+        end_tokens: Token IDs that mean an answer has finished. Needed when one
+            path is the start of another, and must not include the token that
+            continues the longer path at that point. Repeated IDs count once.
 
     Returns:
-        An immutable plan preserving candidate order and requesting only branch
-        scores for the selected paths.
+        A plan for these paths, keeping candidate order.
 
     Raises:
         TypeError: A path is not a sequence of token IDs.
-        ValueError: Labels, token IDs, or path ownership are invalid; a path is
-            empty; or a stopping boundary has missing or overlapping END tokens.
+        ValueError: There are fewer than two candidates, a label or path is
+            empty, a token ID is not a nonnegative integer, two candidates
+            have identical paths, or END tokens are missing or overlap a
+            continuing token where they are needed.
 
     Examples:
+        ``"up"`` is the start of ``"upward"``, so after token 10 the plan asks
+        whether the model stops or continues. After token 11, token 12 is the
+        only possibility, so it needs no score.
+
         >>> plan = build_trie(
         ...     {"up": (10,), "upward": (10, 11, 12), "down": (20,)},
         ...     end_tokens=(99, 100),

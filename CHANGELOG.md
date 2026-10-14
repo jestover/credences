@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Rewrite the README, docstrings, and pure-core walkthrough for readers new to
+  the project: what the package does and why, plain-language definitions,
+  and fewer internal terms. Move checkout-synchronization notes from the README
+  to `AGENTS.md`, run the README example as a doctest, and add newcomer
+  guidance to `docs/style.md`.
 - Adopt Google-style API docstrings and explicit Ruff formatting/lint conventions.
   Add ty as a locked development dependency and check library types in ordinary CI.
 - Refocus API docstrings on purpose, context, input/output meaning, and usage.

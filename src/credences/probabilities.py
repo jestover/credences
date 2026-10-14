@@ -1,9 +1,25 @@
-"""Compute forced-choice probabilities and interpret candidate distributions.
+"""Turn model scores into probabilities, and represent measurement results.
 
-Token-score helpers accept raw model logits and return natural-log probabilities.
-Result types expose the candidate distribution, confidence summaries, and the
-numerical detail needed to inspect or save a result. No function queries a model.
-Raw scores should be float32-range logits supplied as Python floats, or -inf.
+This module has two parts:
+
+- Helpers that turn a model's raw next-token scores into probabilities when
+  only a few tokens are allowed: masked_logprobs, logprob_sum, logsumexp, and
+  validate_readout.
+- The result of a measurement: Measurement and RawReadout, the
+  measurement_from_raw function that builds them, and two helpers for ties.
+
+Nothing here runs a model; every function works on numbers you supply.
+
+Terms used below:
+
+- A *logit* is a model's raw, unnormalized score for a possible next token.
+  Higher is more likely. ``-inf`` means the token is impossible. Pass logits
+  as Python floats.
+- A *log probability* is the natural log of a probability, so it is at most 0.
+  Log probabilities stay precise for answers far too unlikely to represent as
+  ordinary probabilities.
+- A *credence* is the probability a measurement assigns to one candidate
+  answer. A measurement's credences sum to 1 across its candidates.
 """
 
 import math
@@ -20,25 +36,28 @@ _MASS_TOLERANCE = 1e-12
 
 @dataclass(frozen=True)
 class RawReadout:
-    """The numerical detail behind a candidate probability distribution.
+    """The exact numbers behind a Measurement, for auditing and storage.
 
-    Use this record to inspect very small probabilities and which answer
-    representations were scored. A finite log remains informative even when its
-    ordinary probability underflows to zero; ``-inf`` means exact zero mass.
-    Token IDs identify vocabulary entries, not individual characters. Discarded
-    alternatives and individual branch scores are not stored.
+    Most code only needs ``Measurement.credences``. Use this record when you
+    need an answer's precise log credence, or want to know which token IDs
+    were scored for each answer.
+
+    Log credences matter for very unlikely answers. A credence such as
+    e^-1000 rounds to 0.0 as an ordinary float, but its log credence stays
+    -1000.0. Only an answer with exactly zero probability has a log credence
+    of ``-inf``.
 
     Attributes:
-        credence_logprobs: Candidate-to-natural-log-probability mapping, not raw
-            token logits.
-        scored_token_ids: Each candidate's selected complete continuation, bare
-            or leading-space form, excluding the fixed prompt context.
-        context_token_count: Number of tokens in that fixed context.
+        credence_logprobs: Each candidate's credence as a natural-log probability.
+        scored_token_ids: The token IDs scored for each candidate, either the
+            version written as-is or the version with a leading space. Prompt
+            tokens are not included.
+        context_token_count: Number of prompt tokens before the answer.
 
     Examples:
-        Suppose an illustrative tokenizer encodes ``"very positive"`` as two
-        pieces: ``"very"`` (ID 10) and ``" positive"`` (ID 11), while
-        ``"negative"`` is one token (ID 20). If these bare forms are selected:
+        Suppose a tokenizer encodes ``"very positive"`` as ``"very"`` (ID 10)
+        followed by ``" positive"`` (ID 11), and ``"negative"`` as one token
+        (ID 20). These IDs are made up for illustration.
 
         >>> raw = RawReadout(
         ...     credence_logprobs={"very positive": math.log(0.75), "negative": math.log(0.25)},
@@ -56,27 +75,35 @@ class RawReadout:
 
 @dataclass(frozen=True)
 class Measurement:
-    """A candidate probability distribution and summaries for interpreting it.
+    """A model's credences over a set of candidate answers, with summaries.
 
-    Read ``credences`` when you need the full forced-choice distribution, rather
-    than only a hard label. These probabilities describe the supplied candidates
-    under the prompt and representation constraints, not the full vocabulary or
-    a guarantee of calibration. ``raw`` provides log credences and selected paths.
+    ``credences`` is the main result: a probability for each candidate,
+    summing to 1. These probabilities are relative to the candidates you
+    supplied. They say how the model divides its belief among those answers,
+    not how likely it was to write something else, and they are not
+    guaranteed to be calibrated.
 
-    Fields cannot be reassigned, but the dictionaries are not deeply immutable.
+    The three confidence summaries each run from 0 (no better than a uniform
+    guess) to 1 (all probability on one candidate), but they measure different
+    things. In the formulas, K is the number of candidates and p1 and p2 are
+    the largest and second-largest credences.
+
+    Build a measurement with measurement_from_raw. Its fields cannot be
+    reassigned; treat the dictionaries inside as read-only too.
 
     Attributes:
-        credences: Each candidate's forced-choice probability.
-        entropy: Uncertainty across the full distribution, in bits.
-        top_labels: Every exact maximizer of log credence, in candidate order,
-            without rounding or random tie-breaking.
-        top_label_confidence: Strength of the best label over uniform guessing:
-            (p1 - 1/K) / (1 - 1/K), for K candidates and largest probability p1.
-        entropy_confidence: Concentration of the whole distribution:
+        credences: Each candidate's probability, in candidate order.
+        entropy: Shannon entropy of the credences, in bits. It is 0 when one
+            candidate has all the probability and log2(K) when all are equal.
+        top_labels: Every candidate tied for the highest credence, in candidate
+            order. Usually one label. Ties are reported, never broken; see
+            choose_top_label and top_label_weights.
+        top_label_confidence: How far the top candidate is above a uniform
+            guess: (p1 - 1/K) / (1 - 1/K).
+        entropy_confidence: How concentrated the whole distribution is:
             1 - entropy / log2(K).
-        margin_confidence: Lead over the nearest competitor: p1 - p2, where
-            p1 >= p2 are the two largest probabilities.
-        raw: Log credences and selected token paths for inspecting the result.
+        margin_confidence: The top candidate's lead over the runner-up: p1 - p2.
+        raw: Exact log credences and the token IDs scored for each candidate.
     """
 
     credences: dict[str, float]
@@ -88,26 +115,27 @@ class Measurement:
     raw: RawReadout
 
     def to_dict(self) -> dict[str, object]:
-        """Export a measurement for storage or sharing as strict JSON.
+        """Convert the measurement to a dictionary you can save as JSON.
 
-        Return a dictionary with the same named fields and a nested ``raw`` record.
-        Winner tuples and token paths become lists. Only negative-infinity
-        log credences become ``None`` (JSON null); finite logs are preserved,
-        including when the corresponding ordinary credence is zero.
+        The dictionary uses the same field names, with ``raw`` as a nested
+        dictionary, and tuples become lists. JSON has no infinity, so a log
+        credence of ``-inf`` (exactly zero probability) becomes ``None``.
+        Finite log credences stay numbers, even when the ordinary credence
+        has rounded to 0.0. Values are not rounded.
 
-        Editing the returned containers does not change the measurement.
-        No measurement values are rounded or recalculated.
+        The result is a new copy; editing it does not change the measurement.
 
         Returns:
-            Independent JSON-safe containers with the measurement's named fields
-            and a nested raw record.
+            A dictionary that ``json.dumps(..., allow_nan=False)`` accepts.
 
         Raises:
-            ValueError: Credences or summaries are nonfinite, or log credences
-                contain NaN or positive infinity.
+            ValueError: A credence or summary is NaN or infinite, or a log
+                credence is NaN or +inf. This happens only with a hand-built
+                Measurement, not one from measurement_from_raw.
 
         Examples:
-            Underflowed finite logs survive; exact-zero logs become JSON null.
+            A tiny but nonzero credence keeps its log value; an exactly zero
+            credence becomes ``None``.
 
             >>> import json
             >>> raw = RawReadout(
@@ -147,22 +175,23 @@ class Measurement:
 
 
 def validate_readout(wanted: Iterable[int], readout: Mapping[int, float]) -> dict[int, float]:
-    """Require complete, valid token scores before using a model readout.
+    """Check that a model returned a usable score for every requested token.
 
-    Missing or malformed scores cannot be treated as zero weights. Finite
-    logits, including positive values, and ``-inf`` are valid. Unrequested IDs
-    are ignored.
+    Each requested token needs a logit that is a real number or ``-inf``. A
+    missing score raises an error instead of being treated as zero
+    probability; it usually means the model backend returned only its
+    highest-scoring tokens. Scores for tokens you did not request are ignored.
 
     Args:
-        wanted: Token IDs requested from the model; duplicates are checked once.
-        readout: Mapping from token IDs to raw logits.
+        wanted: Token IDs you requested. Repeated IDs are checked once.
+        readout: The model's logits, keyed by token ID.
 
     Returns:
-        A dictionary containing the distinct requested IDs and their validated scores.
+        Each requested token ID, once, with its score.
 
     Raises:
-        BackendReadoutError: A requested score is missing, nonnumeric, NaN, or
-            positive infinity.
+        BackendReadoutError: A requested score is missing, not a number, NaN,
+            or +inf.
 
     Examples:
         >>> validate_readout([10, 10, 20], {10: 2.0, 20: -math.inf, 99: 8.0})
@@ -182,32 +211,37 @@ def validate_readout(wanted: Iterable[int], readout: Mapping[int, float]) -> dic
 
 
 def masked_logprobs(allowed: Iterable[int], readout: Mapping[int, float]) -> dict[int, float]:
-    """Find next-token probabilities when only the allowed tokens may be chosen.
+    """Compute next-token probabilities when only some tokens are allowed.
 
-    Probabilities are normalized over distinct allowed IDs only, not the full
-    vocabulary.
+    This is a softmax over the allowed tokens alone: their logits are turned
+    into probabilities that sum to 1, ignoring the rest of the vocabulary.
+    Each step of a candidate answer is scored this way.
 
-    One allowed token is forced with probability 1 and needs no score. If all
-    allowed scores are ``-inf``, use a uniform token distribution; otherwise
-    individual ``-inf`` scores get zero mass.
+    Special cases:
 
-    When several tokens mean stopping, include each END ID alongside continuing
-    tokens, then combine their returned log probabilities with logprob_sum.
+    - If only one distinct token is allowed, it gets probability 1 and needs
+      no score.
+    - A token with logit ``-inf`` gets probability 0.
+    - If every allowed token has logit ``-inf``, they share the probability
+      equally.
+
+    To score several stopping (END) tokens as one choice, include each of
+    them in ``allowed`` and then add their results with logprob_sum.
 
     Args:
-        allowed: Nonempty collection of permitted token IDs.
-        readout: Raw logits for each allowed ID, not ordinary probabilities.
-            May be empty when there is only one distinct allowed ID.
+        allowed: Token IDs the model may choose from. Repeated IDs are counted once.
+        readout: The model's logits, keyed by token ID. Can be empty when
+            only one distinct token is allowed.
 
     Returns:
-        A mapping from each distinct allowed ID to its natural-log probability.
+        The natural-log probability of each distinct allowed token.
 
     Raises:
-        ValueError: The allowed set is empty.
-        BackendReadoutError: A required branch score is missing or malformed.
+        ValueError: ``allowed`` is empty.
+        BackendReadoutError: A needed score is missing or invalid.
 
     Examples:
-        Round only display output, not the returned log probabilities.
+        Results are log probabilities; exponentiate them to see probabilities.
 
         >>> logs = masked_logprobs([10, 20], {10: 2.0, 20: 1.0})
         >>> {token: round(math.exp(value), 6) for token, value in logs.items()}
@@ -234,26 +268,26 @@ def masked_logprobs(allowed: Iterable[int], readout: Mapping[int, float]) -> dic
 
 
 def logsumexp(values: Iterable[float]) -> float:
-    """Find a summed weight while keeping inputs and output in log space.
+    """Add numbers that are stored as natural logs, and return the log of the sum.
 
-    Supply natural-log weights and receive the natural log of their summed
-    weight. This does not normalize the inputs: a positive result is valid
-    when the total weight exceeds 1. For a normalized probability event, use
-    logprob_sum instead.
+    Computes log(exp(a) + exp(b) + ...) without overflowing on large inputs or
+    losing small ones. The inputs are general weights, so the result can be
+    positive. To add the probabilities of outcomes that make up one event,
+    use logprob_sum, which also checks that the total is at most 1.
 
     Args:
         values: Natural-log weights, each finite or ``-inf``.
 
     Returns:
-        The natural log of the summed weight, or ``-inf`` for empty or
-        all-zero-mass input.
+        The natural log of the total weight. Empty input, or input that is
+        all ``-inf``, gives ``-inf``.
 
     Raises:
         TypeError: An input is not a real number.
-        ValueError: An input is NaN, positive infinity, or outside the numeric range.
+        ValueError: An input is NaN, +inf, or too large to convert to a float.
 
     Examples:
-        Two unit weights sum to 2, so their summed log weight is positive.
+        Two weights of 1 sum to 2, so the result is log(2).
 
         >>> round(logsumexp([0.0, 0.0]), 6)
         0.693147
@@ -268,31 +302,33 @@ def logsumexp(values: Iterable[float]) -> float:
 
 
 def logprob_sum(values: Iterable[float]) -> float:
-    """Find the probability of an event with several mutually exclusive outcomes.
+    """Combine the probabilities of several outcomes that count as one event.
 
-    Supply normalized natural-log probabilities, not raw logits or ordinary
-    probabilities. Return the natural log of their summed probability. For
-    example, multiple END tokens can all represent choosing to stop.
+    For example, if a model can stop an answer with either of two END tokens,
+    the probability of stopping is the sum of both. Inputs and output are
+    natural-log probabilities, not logits.
 
-    Input logs must be nonpositive, and event mass must not exceed 1 beyond
-    relative tolerance 1e-12. Tiny positive output caused by roundoff is bounded
-    at 0; negative logs are preserved.
+    The outcomes must not overlap, so their total is at most 1. A total just
+    above 1 from floating-point roundoff (relative error up to 1e-12) is
+    returned as 0.0, meaning probability 1. A larger total raises an error,
+    because it means the inputs were not probabilities of separate outcomes.
 
     Args:
-        values: Nonpositive natural-log probabilities of mutually exclusive outcomes.
+        values: Natural-log probabilities of non-overlapping outcomes, each at
+            most 0.
 
     Returns:
-        The event's natural-log probability, or ``-inf`` for empty or
-        all-zero-mass input.
+        The natural-log probability of the combined event. Empty input, or
+        input that is all ``-inf``, gives ``-inf``.
 
     Raises:
         TypeError: An input is not a real number.
-        ValueError: An input is an invalid log probability or total mass exceeds
-            1 beyond the normalization tolerance.
+        ValueError: An input is positive, NaN, or +inf, or the probabilities
+            sum to more than 1.
 
     Examples:
-        Two END tokens compete with one continuation token. Group only after
-        normalizing all three distinct IDs.
+        One token continues the answer and two END tokens stop it. Score all
+        three together, then combine the two END tokens.
 
         >>> steps = masked_logprobs([11, 99, 100], {11: 0.0, 99: 0.0, 100: 0.0})
         >>> stopping = logprob_sum(steps[token] for token in (99, 100))
@@ -309,31 +345,31 @@ def logprob_sum(values: Iterable[float]) -> float:
 
 
 def measurement_from_raw(raw: RawReadout) -> Measurement:
-    """Turn scored candidate answers into a distribution and confidence summaries.
+    """Build a Measurement from each candidate's log credence.
 
-    Supply a RawReadout containing normalized candidate log probabilities and
-    one selected token path per candidate. These are final candidate log
-    credences, not raw token logits or unnormalized answer likelihoods. Return
-    a Measurement with probabilities, all exact winners, entropy in bits, and
-    the three confidence summaries, preserving the input's candidate order.
+    Use this when you have one natural-log probability per candidate, for
+    example from TriePlan.score. It computes the credences, the winners, the
+    entropy, and the three confidence summaries.
 
-    Implied probability mass must sum to 1 within relative tolerance 1e-12,
-    without label-level renormalization. Raw logs stay unchanged, including
-    finite logs whose probabilities underflow.
-    Confidence summaries lie in [0, 1], allowing for boundary roundoff.
+    The credences must already sum to 1, within a relative tolerance of
+    1e-12. They are not rescaled for you: a total that is off means
+    something upstream went wrong, and rescaling would hide it.
+
+    Candidate order follows ``raw.credence_logprobs``. The measurement keeps
+    its own copies of the input, so later changes to ``raw`` do not affect it.
 
     Args:
-        raw: Log probabilities for at least two candidates, with matching selected
-            path keys. Mapping order defines candidate order.
+        raw: Log credences and scored token IDs for at least two candidates,
+            with the same candidates in both mappings.
 
     Returns:
-        A Measurement containing the vector, summaries, and an independent raw
-        snapshot.
+        The measurement.
 
     Raises:
         TypeError: A log credence is not a real number.
-        ValueError: Candidate/path keys are invalid, a log credence is invalid,
-            or the distribution is not normalized.
+        ValueError: There are fewer than two candidates, the two mappings name
+            different candidates, a log credence is positive, NaN, or +inf,
+            or the credences do not sum to 1.
 
     Examples:
         >>> raw = RawReadout(
@@ -391,25 +427,25 @@ def measurement_from_raw(raw: RawReadout) -> Measurement:
 
 
 class _ChoiceRng(Protocol):
-    """Typing interface for a caller-owned RNG; no runtime validation or state."""
+    """Any random number generator with a ``choice`` method, such as random.Random."""
 
     def choice(self, seq: Sequence[str], /) -> str: ...
 
 
 def choose_top_label(measurement: Measurement, *, rng: _ChoiceRng) -> str:
-    """Choose one hard label when an application must resolve exact winners.
+    """Pick a single winning label, breaking any tie at random.
 
-    Measurement preserves every winner in ``top_labels``. Call this helper
-    explicitly to select one uniformly, using your own random.Random-compatible
-    generator. The distribution and winner set do not change; the supplied
-    generator owns the random state.
+    A measurement lists every tied winner in ``top_labels`` and never breaks
+    ties itself. Use this when your application needs exactly one label.
+    Pass a seeded ``random.Random`` to make the choice reproducible. The
+    measurement is not changed.
 
     Args:
-        measurement: Result whose exact winners are eligible for selection.
-        rng: Caller-owned generator with a uniform ``choice`` method.
+        measurement: The measurement to pick a winner from.
+        rng: The random number generator to use, such as ``random.Random(0)``.
 
     Returns:
-        One member of the measurement's top_labels tuple.
+        One of the labels in ``measurement.top_labels``, chosen uniformly.
 
     Raises:
         ValueError: The measurement has no top labels.
@@ -432,19 +468,21 @@ def choose_top_label(measurement: Measurement, *, rng: _ChoiceRng) -> str:
 
 
 def top_label_weights(measurement: Measurement) -> dict[str, float]:
-    """Count winning labels without arbitrarily breaking ties.
+    """Split one win equally among tied winners, for counting results.
 
-    Return a dictionary assigning each of N exact winners weight 1/N, omitting
-    non-winners. Add these dictionaries across measurements for fractional
-    winner counts. These weights are not the candidate probabilities.
-    For example, two winners with credence 0.4 each receive counting weight
-    0.5 each. The measurement is unchanged. An empty winner set raises.
+    Each of the N labels in ``top_labels`` gets weight 1/N; other labels are
+    left out. Adding these dictionaries over many measurements counts how
+    often each label won, with ties shared instead of broken at random.
+
+    These weights are not credences. Two winners with credence 0.4 each get
+    weight 0.5 each.
 
     Args:
-        measurement: Result whose exact winners contribute to the count.
+        measurement: The measurement whose winners to count.
 
     Returns:
-        Winner-to-counting-weight mapping in top_labels order; weights sum to 1.
+        Each winning label with its weight, in ``top_labels`` order. The
+        weights sum to 1.
 
     Raises:
         ValueError: The measurement has no top labels.

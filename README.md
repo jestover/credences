@@ -1,33 +1,128 @@
 # credences
 
-LLM credence vectors over fixed answer sets.
+Measure how a language model divides its belief among a fixed set of answers.
 
-**Status:** the pure candidate-path selector, trie/readout plans, probability
-calculations, confidence summaries, result dataclasses, JSON serialization, and
-tie helpers are implemented. Tokenization, model loading, and the model-backed
-measurement API are not implemented yet.
+Ask a model a multiple-choice question, such as "Is this sentence positive,
+negative, or neutral?" Rather than keeping only the answer it would write,
+`credences` reads the model's next-token probabilities and returns a
+probability for every allowed answer:
 
-## Worked examples
+```python
+{"positive": 0.91, "negative": 0.03, "neutral": 0.06}
+```
 
-Start with [small examples of the pure core](docs/pure-core.md): candidate paths
-through selection and trie scoring, result construction, JSON, ties, and
-numerical edge cases. Core docstrings also contain small runnable examples.
-They explain API purpose and usage; the walkthrough connects multiple objects,
-and sparse code comments explain non-obvious implementation choices.
-The normal test command checks both, alongside the behavioral tests.
+This is the model's *credence vector*. It shows which answer the model prefers
+and how strongly, and it is the input for confidence measures such as entropy
+or the gap between the top two answers.
 
-## Style conventions
+## Status
 
-Use [Google-style API docstrings and the project code conventions](docs/style.md).
-Ruff handles formatting, imports, naming, common mistakes, annotations, and
-docstring structure. `ty` checks shipped library code; examples and deliberately
-malformed test inputs remain covered by runtime tests.
+Early development. The package is not yet on PyPI.
 
-## Development setup
+- **Available now:** the scoring math and result types. Given the token IDs
+  for each answer and a model's logits (raw next-token scores), `credences`
+  computes each answer's probability, confidence summaries, and JSON output.
+- **Not yet available:** tokenizing answers, loading a model, and a one-call
+  measurement API. The planned API looks like this:
 
-This is a Python >= 3.14 library, initialized with `uv init --lib` and built with
-Hatchling. See [uv's library guide](https://docs.astral.sh/uv/concepts/projects/init/#libraries).
-Development uses Python 3.14.8, pinned in `.python-version` and managed by uv.
+  ```python
+  # Planned; not implemented yet.
+  from credences import load_model, build_credoscope
+
+  model = load_model("mlx-community/Qwen3-4B-4bit")  # local model via MLX
+  scope = build_credoscope(model, candidates=["positive", "negative", "neutral"])
+  result = scope.measure(prompt="Classify the sentiment of: 'Revenue beat expectations.' ...")
+  result.credences
+  ```
+
+## How answers are scored
+
+A model writes one token at a time, and an answer such as `"very positive"`
+may be several tokens. To get one probability per answer:
+
+1. **Encode each answer twice:** as written, and with a space in front.
+   Tokenizers often split `"positive"` and `" positive"` into different tokens,
+   and a model may expect either right after the prompt. For each answer,
+   `credences` keeps whichever version's first token the model scores higher.
+2. **Score only the allowed tokens.** At each step, the model's scores for the
+   tokens the answers allow there are turned into probabilities among those
+   tokens alone, ignoring the rest of the vocabulary.
+3. **Multiply along each answer.** An answer's probability is the product of
+   its steps. Answers that start with the same token share that step's
+   probability instead of each counting it in full. When one answer is the
+   start of another (`"up"` and `"upward"`), the model's choice to stop is read
+   from its end-of-answer tokens.
+
+The resulting probabilities sum to 1 over your answers. They describe how the
+model divides its belief among the answers you gave, for that prompt; they are
+not guaranteed to be calibrated.
+
+## Try it
+
+You need [uv](https://docs.astral.sh/uv/) and Python 3.14. From a clone of
+this repository:
+
+```bash
+uv sync --group dev
+```
+
+The current version works on token IDs and logits you provide. Here, two
+one-token answers use made-up token IDs and logits:
+
+```pycon
+>>> from credences import RawReadout
+>>> from credences.probabilities import measurement_from_raw
+>>> from credences.trie import build_trie
+>>> plan = build_trie({"yes": (10,), "no": (20,)})  # "yes" is token 10, "no" is 20
+>>> logs = plan.score({(): {10: 2.0, 20: 1.0}})  # the model's logits for each token
+>>> result = measurement_from_raw(RawReadout(logs, dict(plan.paths), context_token_count=12))
+>>> {label: round(p, 3) for label, p in result.credences.items()}
+{'yes': 0.731, 'no': 0.269}
+>>> result.top_labels
+('yes',)
+
+```
+
+For multi-token answers, the with-and-without-space choice, shared first
+tokens, and saving results, follow the
+[walkthrough of the scoring core](docs/pure-core.md).
+
+## What a measurement contains
+
+`Measurement.credences` holds the probabilities. The other fields summarize
+them, for K answers whose largest and second-largest probabilities are p1 and
+p2:
+
+| Field | Meaning |
+|---|---|
+| `top_labels` | Every answer tied for the highest probability; usually one |
+| `entropy` | Shannon entropy in bits: 0 when certain, log2(K) when all answers are equal |
+| `top_label_confidence` | How far the top answer is above a uniform guess: `(p1 - 1/K) / (1 - 1/K)` |
+| `entropy_confidence` | How concentrated the whole distribution is: `1 - entropy / log2(K)` |
+| `margin_confidence` | The top answer's lead over the runner-up: `p1 - p2` |
+
+Each confidence summary runs from 0 to 1, and is 1 when one answer has all
+the probability.
+`measurement.raw` keeps the exact log probabilities, which stay meaningful even
+for answers too unlikely to show as anything but 0.0, and the token IDs scored
+for each answer. `measurement.to_dict()` gives a copy you can save as JSON.
+
+Ties are never broken silently. Use `choose_top_label(result, rng=...)` to pick
+one winner with your own random generator, or `top_label_weights(result)` to
+split a win equally when counting results.
+
+## Documentation
+
+- [Walkthrough of the scoring core](docs/pure-core.md): runnable examples from
+  token IDs to a saved result.
+- API reference: the docstrings, for example `help(credences.trie)`. Their
+  examples run as tests.
+- [Conceptual note](confidence-notes.pdf): why the credence vector is the
+  primary result and how the confidence summaries derive from it.
+
+## Contributing
+
+Run the checks before sending a change:
 
 ```bash
 uv sync --locked --group dev
@@ -39,214 +134,22 @@ uv run pytest
 uv build
 ```
 
-### Original checkout and isolated development
+`uv run pytest` needs no model weights. It also runs the examples in this
+README, the walkthrough, and the docstrings.
 
-Delta development stays in an isolated checkout. The original project folder
-tracks GitHub's `main` as a clean review/run copy and is synchronized after each
-completed publishing step passes CI. This is an explicit Git update, not a
-background filesystem mirror.
+These documents describe the design and how to work on it:
 
-For changes published elsewhere, run this in the original project folder:
+- [`docs/style.md`](docs/style.md): code and docstring conventions.
+- [`tests/README.md`](tests/README.md): what each test file guards.
+- [`SPEC.md`](SPEC.md): the full design of version 1, including the planned API.
+- [`DECISIONS.md`](DECISIONS.md): why the design is shaped this way.
+- [`PLAN.md`](PLAN.md): the build order.
+- [`POSSIBLE_FUTURE_EXTENSIONS.md`](POSSIBLE_FUTURE_EXTENSIONS.md): ideas kept
+  out of version 1 on purpose.
+- [`AGENTS.md`](AGENTS.md): the working agreement for coding agents and
+  maintainers, including how the main checkout is kept in sync.
+- [`CHANGELOG.md`](CHANGELOG.md): changes so far.
 
-```bash
-git pull --ff-only
-```
+## License
 
-Keep development edits in the isolated checkout. If the original folder has
-local changes or diverges, resolve them deliberately rather than resetting or
-forcing an update. Its local-only `backup/original-scaffold` branch preserves
-the files present before the initial synchronization.
-
-The `dev` group includes pytest, Hypothesis, Ruff, ty, and import-linter. The package
-has no runtime dependencies yet; model and DataFrame integrations will be optional
-extras as they are implemented. No model weights are needed for the pure core.
-
-The GitHub Actions workflow runs the checks above and requires pytest to pass.
-Tests cover result persistence, selected-trie scoring, exact readout requirements,
-confidence summaries, and caller-controlled tie handling. Hypothesis checks
-production selection and trie scoring against an independent Decimal reference
-across generated paths and golden examples, as well as normalization,
-candidate-order invariance, and finite logs through probability underflow.
-
-CI also installs the built wheel into an isolated environment and checks that it
-imports, includes `py.typed`, and has no runtime dependencies. Import-linter is
-configured to keep pure math free of tokenizer, backend, and DataFrame
-dependencies; extend the contracts as modules are introduced. The opt-in MLX job
-will follow when real-model tests and the MLX extra exist; no model weights are
-downloaded now.
-
-## Implemented result contract
-
-`Measurement` and `RawReadout` are available from `credences`. They are data
-containers for already-computed results; they do not calculate probabilities or
-run a model. A measurement holds the probability vector, exact winning labels,
-and confidence summaries. Its raw readout holds natural-log credences, selected
-complete token paths, and fixed-context token count. The dataclasses prevent
-field reassignment, but their dictionaries are not deeply immutable.
-
-`measurement.to_dict()` returns a detached snapshot suitable for
-`json.dumps(..., allow_nan=False)`, with the same named fields and a nested `raw`
-dictionary. Winner tuples and token paths become lists. Exact-zero log credences
-(`-inf`) become JSON `null`; finite logs remain numbers even if the corresponding
-probability has underflowed to zero. Invalid nonfinite values raise `ValueError`
-rather than producing nonstandard JSON. Serialization does not round,
-renormalize, or recompute the result.
-
-## Implemented probability rules and summaries
-
-The internal pure math layer normalizes over distinct allowed token ids in log
-space. Singleton transitions are forced without scores. All-`-inf` branches
-fall back to uniform tokens; otherwise `-inf` tokens get zero. Missing, NaN, or
-positive-infinity requested scores raise `BackendReadoutError`. END tokens are
-normalized individually and their probabilities are then aggregated.
-Grouped events correct tiny positive log-probability roundoff at the unit-mass
-boundary, while larger excess mass remains an error; negative logs are preserved.
-
-The result builder derives the vector and summaries from normalized log
-credences. It checks total mass within `1e-12` relative tolerance, never adds a
-label-level renormalization, and identifies winners using exact log comparisons.
-For `K` candidates and sorted credences `p1 >= p2 >= ...`:
-
-| Summary | Definition |
-|---|---|
-| `entropy` | Shannon entropy in bits, with zero-mass terms omitted |
-| `top_label_confidence` | `(p1 - 1/K) / (1 - 1/K)` |
-| `entropy_confidence` | `1 - entropy / log2(K)` |
-| `margin_confidence` | `p1 - p2` |
-
-Confidence values are bounded to `[0, 1]` to remove boundary roundoff, without
-rounding the vector or raw logs. Backend logits will be supplied as float32;
-pure computations use Python's higher-precision floats. See `CHANGELOG.md` for
-the numerical-policy clarification.
-
-Two optional helpers are available from `credences`:
-`choose_top_label(measurement, rng=...)` uses only a caller-supplied RNG;
-`top_label_weights(measurement)` gives equal counting weights to tied winners,
-not their credences.
-
-## Implemented candidate-path selection and trie plans
-
-The internal `credences.trie` module consumes already-encoded paths and supplied
-scores. It does not tokenize strings or call a model.
-
-1. Each candidate has named `bare` and `spaced` complete paths. Preflight checks
-   both, rejecting cross-label path collisions and possible stopping boundaries
-   without a usable, disjoint END set. One candidate's own alternatives never
-   coexist and do not create stopping decisions.
-2. The initial readout covers every distinct first token of both forms.
-   Selection keeps the entire higher-scoring path, with bare preferred on exact
-   ties, including `-inf` ties. It does not compare whole-answer likelihoods or
-   add a probability for choosing a form.
-3. The selected trie merges shared prefixes and compiles branching readouts.
-   Forced transitions and leaves need no scores. A terminal with children
-   includes every distinct END id alongside continuation ids.
-4. Scoring reuses initial scores at the selected root. Later readouts need the
-   unchanged context plus their complete continuation prefix, including forced
-   tokens. The plan combines branch log probabilities into candidate log
-   credences without label-level renormalization.
-
-For example, selected paths `[pos, itive]` and `[pos, it, ion]` share a forced
-`pos` prefix. There is one later comparison between `itive` and `it`; the final
-`ion` is forced. Selecting single-token spaced forms instead removes that later
-branch. These pieces illustrate structure, not a particular tokenizer.
-
-A plan owns immutable paths, END ids, and readout requests—not scores, prompts,
-or model state. It can be reused for identical ordered selected paths and END,
-but form selection must still run again for each measurement. No plan cache is
-implemented yet. The production selector and trie now pass the independent
-chain-rule reference tests; real tokenization and model execution remain next.
-
-## Design documents
-
-These files describe the intended `credences` package and are the starting context
-for implementation in this repository.
-
-These docs define the intended package, not an already implemented API.
-`DECISIONS.md` explains the rationale for the design.
-
-## Current core
-
-- Arbitrary-token logit access at supplied contexts; MLX is the first backend.
-  Restricted top-K probability APIs are outside the core, not a release milestone.
-- Two canonical forms per candidate: bare and one additional ASCII space.
-  First-token logits select one complete path per candidate; score only the
-  selected trie, merging shared prefixes. Exact form-score ties select bare.
-- Forced transitions have probability 1. At a branching node, an all-`-inf`
-  readout falls back to uniform over allowed tokens; otherwise `-inf` tokens
-  get zero and finite scores normalize normally.
-- Native assistant opening with no automatic answer cue. Optional assistant
-  prefills are supplied through `messages=`; all context tokens stay fixed.
-  Task wording, code meanings, and option randomization stay external.
-- `print(scope.preview(prompt=...))` shows the full compiled context and each
-  candidate's possible continuations, including visible whitespace and token paths, without
-  inference. It cannot predict which form the score readout will select.
-- Explicit `reasoning="bypass"` at construction; no redundant reasoning or run
-  metadata fields on each measurement.
-- Independent measurements; reusable pure trie plans, but no model state carried
-  between calls. Loaded weights remain reusable. Corpus sharding and model-weight
-  staging remain external.
-- A uv-managed library project with `src/credences/`, `py.typed`, `pyproject.toml`,
-  and committed `uv.lock`. Use uv for dependencies, environments, checks, and builds.
-
-The optional space is only at the start of the complete candidate, not before
-each token. Encode both whole forms canonically; do not enumerate other
-segmentations, case variants, or additional whitespace. For example,
-`"very positive"` may have paths `["very", " positive"]` and
-`[" very", " positive"]`, but not `["very", "positive"]`. Select by first-token
-score, preserving the selected form's entire suffix. Tokenization can change more
-than the first piece: `"positive"` may be `["pos", "itive"]` while `" positive"`
-is one token. Do not find alternatives by regex-matching only the first piece.
-
-The selected paths determine branch points. With `positive` and `position`, both
-bare paths might start with `"pos"`; that prefix needs a later comparison only if
-both paths are selected. A shared first token receives one root weight, not one
-per label. See the worked example in SPEC §8.4. Selection is not summing or
-averaging both forms, and a token-uniform fallback need not be label-uniform.
-
-Prefill whitespace is literal: `"Answer: "` stays in the fixed context, so the
-two forms produce one or two spaces before the label. This is a specified
-token-trie constraint, not a claim to capture every possible answer spelling or
-to remove prompt sensitivity. Different token granularities can also affect the
-locally masked distribution (SPEC §5.5).
-
-Read `SPEC.md` §4.2-§4.4 and §8 together for input handling, starting forms, and
-preview. Preview shares measurement's inference-free preparation and displays
-both alternatives without rewriting context; `raw.scored_token_ids` records the
-one selected path per candidate after measurement. Model loading ownership,
-backend request lifetime, and supported-tokenizer validation remain implementation checkpoints
-(§16), not reasons to postpone this review.
-
-## What each file is for
-
-- `confidence-notes.typ` is the conceptual note: why the credence vector is the
-  primitive object and why the confidence summaries are derived from it.
-- `confidence-notes.pdf` is rendered output from `confidence-notes.typ`; do not
-  treat it as a separate source.
-- `SPEC.md` is the normative contract for v1. It defines the API, measurement
-  semantics, result objects, backend contract, architecture, and tests.
-- `DECISIONS.md` records why the design is shaped this way. It should explain the
-  load-bearing choices without duplicating the mechanics from the spec.
-- `PLAN.md` turns the spec into an implementation sequence with phase gates.
-- `AGENTS.md` is the working agreement for coding agents and humans implementing
-  the package.
-- `POSSIBLE_FUTURE_EXTENSIONS.md` is a parking lot for useful additions that
-  should not enter the minimal core, including a standalone prompt renderer with
-  presentation randomization and semantic-mapping metadata, plus generated
-  reasoning modes beyond v1's explicit `reasoning="bypass"`.
-
-## Suggested review order
-
-1. `confidence-notes.typ` for the conceptual frame.
-2. This `README.md` for the map of the docs.
-3. `SPEC.md` sections 1-8 for the core contract: purpose, API shape, measurand,
-   result object, trie semantics, and the continuation-tokenization walkthrough.
-4. `DECISIONS.md` for the rationale behind the contract.
-5. `SPEC.md` sections 9-16 for reasoning, backend capabilities, prompt ownership,
-   architecture, testing, distribution, and open questions.
-6. `PLAN.md` to check that the project can be built in a sensible order.
-7. `AGENTS.md` to review implementation discipline and source-of-truth rules.
-8. `POSSIBLE_FUTURE_EXTENSIONS.md` after the v1 shape is clear.
-
-Readers who already know the conceptual note can start with this README, then
-follow steps 3-8. For implementation work, read `SPEC.md`, `DECISIONS.md`, and
-`PLAN.md` before writing code.
+MIT. See [LICENSE](LICENSE).

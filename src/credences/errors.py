@@ -1,26 +1,25 @@
-"""Exceptions applications can handle when credence computation fails."""
+"""Exceptions raised by credences."""
 
 
 class CredencesError(Exception):
-    """Base exception for handling package-specific measurement failures.
+    """Base class for errors specific to credences.
 
-    Catch this base class when you do not need a separate handler for each
-    credences exception type. Ordinary validation errors such as ValueError
-    are not part of this hierarchy.
+    Catch this to handle every credences-specific failure in one place.
+    Invalid arguments, such as an empty list of candidates, raise the
+    standard ValueError or TypeError instead.
     """
 
 
 class BackendReadoutError(CredencesError):
-    """Required token scores are missing or cannot be used as logits.
+    """The model's scores are incomplete or invalid.
 
-    Check that the supplied readout contains every requested token ID and real
-    numeric scores. If using a backend, it must not truncate the result to its
-    top-scoring tokens. NaN and positive infinity are invalid; negative infinity
-    is a valid zero weight.
+    Raised when a token score you asked for is missing, is not a number, or
+    is NaN or +inf. A missing score is never treated as zero probability. If
+    a model backend raises this, check that it returns a score for every
+    requested token rather than only its highest-scoring tokens. A score of
+    ``-inf`` is valid and means the token is impossible.
 
     Examples:
-        Missing scores are errors, not zero weights.
-
         >>> from credences.probabilities import validate_readout
         >>> validate_readout([10, 20], {10: 2.0})
         Traceback (most recent call last):
