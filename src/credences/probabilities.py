@@ -23,28 +23,30 @@ class RawReadout:
     """The numerical detail behind a candidate probability distribution.
 
     Use this record to inspect very small probabilities and which answer
-    representations were scored. ``credence_logprobs`` contains the natural log
-    of each candidate's probability, not raw token logits. A finite log remains
-    informative even when its ordinary probability underflows to zero; ``-inf``
-    means exact zero mass.
+    representations were scored. A finite log remains informative even when its
+    ordinary probability underflows to zero; ``-inf`` means exact zero mass.
+    Token IDs identify vocabulary entries, not individual characters. Discarded
+    alternatives and individual branch scores are not stored.
 
-    ``scored_token_ids`` maps each candidate answer string to the token IDs of its
-    selected complete continuation, which may be the bare or leading-space form.
-    IDs identify entries in the model's vocabulary, not individual characters.
-    ``context_token_count`` is the length of the fixed prompt context. Paths
-    exclude that context; discarded alternatives and branch scores are not stored.
+    Attributes:
+        credence_logprobs: Candidate-to-natural-log-probability mapping, not raw
+            token logits.
+        scored_token_ids: Each candidate's selected complete continuation, bare
+            or leading-space form, excluding the fixed prompt context.
+        context_token_count: Number of tokens in that fixed context.
 
-    Suppose an illustrative tokenizer encodes ``"very positive"`` as two pieces:
-    ``"very"`` (ID 10) and ``" positive"`` (ID 11), while ``"negative"`` is one
-    token (ID 20). If these bare forms are selected, the record contains:
+    Examples:
+        Suppose an illustrative tokenizer encodes ``"very positive"`` as two
+        pieces: ``"very"`` (ID 10) and ``" positive"`` (ID 11), while
+        ``"negative"`` is one token (ID 20). If these bare forms are selected:
 
-    >>> raw = RawReadout(
-    ...     credence_logprobs={"very positive": math.log(0.75), "negative": math.log(0.25)},
-    ...     scored_token_ids={"very positive": (10, 11), "negative": (20,)},
-    ...     context_token_count=7,
-    ... )
-    >>> raw.scored_token_ids["very positive"]
-    (10, 11)
+        >>> raw = RawReadout(
+        ...     credence_logprobs={"very positive": math.log(0.75), "negative": math.log(0.25)},
+        ...     scored_token_ids={"very positive": (10, 11), "negative": (20,)},
+        ...     context_token_count=7,
+        ... )
+        >>> raw.scored_token_ids["very positive"]
+        (10, 11)
     """
 
     credence_logprobs: dict[str, float]
@@ -61,20 +63,20 @@ class Measurement:
     under the prompt and representation constraints, not the full vocabulary or
     a guarantee of calibration. ``raw`` provides log credences and selected paths.
 
-    ``entropy`` measures uncertainty across the distribution in bits.
-    ``top_labels`` contains every exact maximizer of log credence in candidate
-    order, without rounding or random tie-breaking.
-
-    The three confidence summaries answer different questions:
-
-    - ``top_label_confidence``: how strongly is the best label favored over
-      uniform guessing? For K candidates, it is (p1 - 1/K) / (1 - 1/K).
-    - ``entropy_confidence``: how concentrated is the whole distribution?
-      It is 1 - entropy / log2(K).
-    - ``margin_confidence``: how far ahead is the best label of its nearest
-      competitor? It is p1 - p2, with p1 >= p2 the two largest probabilities.
-
     Fields cannot be reassigned, but the dictionaries are not deeply immutable.
+
+    Attributes:
+        credences: Each candidate's forced-choice probability.
+        entropy: Uncertainty across the full distribution, in bits.
+        top_labels: Every exact maximizer of log credence, in candidate order,
+            without rounding or random tie-breaking.
+        top_label_confidence: Strength of the best label over uniform guessing:
+            (p1 - 1/K) / (1 - 1/K), for K candidates and largest probability p1.
+        entropy_confidence: Concentration of the whole distribution:
+            1 - entropy / log2(K).
+        margin_confidence: Lead over the nearest competitor: p1 - p2, where
+            p1 >= p2 are the two largest probabilities.
+        raw: Log credences and selected token paths for inspecting the result.
     """
 
     credences: dict[str, float]
@@ -94,24 +96,33 @@ class Measurement:
         including when the corresponding ordinary credence is zero.
 
         Editing the returned containers does not change the measurement.
-        Invalid nonfinite values raise ValueError rather than producing
-        nonstandard JSON. No measurement values are rounded or recalculated.
+        No measurement values are rounded or recalculated.
 
-        Underflowed finite logs survive; exact-zero logs become JSON null:
+        Returns:
+            Independent JSON-safe containers with the measurement's named fields
+            and a nested raw record.
 
-        >>> import json
-        >>> raw = RawReadout(
-        ...     {"A": 0.0, "tiny": -1000.0, "zero": -math.inf},
-        ...     {"A": (1,), "tiny": (2,), "zero": (3,)}, 7,
-        ... )
-        >>> result = measurement_from_raw(raw)
-        >>> exported = result.to_dict()
-        >>> exported["raw"]["credence_logprobs"]
-        {'A': 0.0, 'tiny': -1000.0, 'zero': None}
-        >>> exported["raw"]["scored_token_ids"]["A"]
-        [1]
-        >>> json.loads(json.dumps(exported, allow_nan=False))["top_labels"]
-        ['A']
+        Raises:
+            ValueError: Credences or summaries are nonfinite, or log credences
+                contain NaN or positive infinity.
+
+        Examples:
+            Underflowed finite logs survive; exact-zero logs become JSON null.
+
+            >>> import json
+            >>> raw = RawReadout(
+            ...     {"A": 0.0, "tiny": -1000.0, "zero": -math.inf},
+            ...     {"A": (1,), "tiny": (2,), "zero": (3,)},
+            ...     7,
+            ... )
+            >>> result = measurement_from_raw(raw)
+            >>> exported = result.to_dict()
+            >>> exported["raw"]["credence_logprobs"]
+            {'A': 0.0, 'tiny': -1000.0, 'zero': None}
+            >>> exported["raw"]["scored_token_ids"]["A"]
+            [1]
+            >>> json.loads(json.dumps(exported, allow_nan=False))["top_labels"]
+            ['A']
         """
         return {
             "credences": {
@@ -138,16 +149,24 @@ class Measurement:
 def validate_readout(wanted: Iterable[int], readout: Mapping[int, float]) -> dict[int, float]:
     """Require complete, valid token scores before using a model readout.
 
-    ``wanted`` identifies the token IDs you requested; ``readout`` supplies their
-    raw logits. Return a dictionary containing only those IDs. Missing scores,
-    NaN, or positive infinity raise BackendReadoutError: they cannot be treated
-    as zero weights. Finite logits, including positive values, and ``-inf`` are
-    valid. Unrequested IDs are ignored.
+    Missing or malformed scores cannot be treated as zero weights. Finite
+    logits, including positive values, and ``-inf`` are valid. Unrequested IDs
+    are ignored.
 
-    Positive logits are valid; repeated wanted IDs are checked once:
+    Args:
+        wanted: Token IDs requested from the model; duplicates are checked once.
+        readout: Mapping from token IDs to raw logits.
 
-    >>> validate_readout([10, 10, 20], {10: 2.0, 20: -math.inf, 99: 8.0})
-    {10: 2.0, 20: -inf}
+    Returns:
+        A dictionary containing the distinct requested IDs and their validated scores.
+
+    Raises:
+        BackendReadoutError: A requested score is missing, nonnumeric, NaN, or
+            positive infinity.
+
+    Examples:
+        >>> validate_readout([10, 10, 20], {10: 2.0, 20: -math.inf, 99: 8.0})
+        {10: 2.0, 20: -inf}
     """
     scores = {}
     for token in dict.fromkeys(wanted):
@@ -165,28 +184,39 @@ def validate_readout(wanted: Iterable[int], readout: Mapping[int, float]) -> dic
 def masked_logprobs(allowed: Iterable[int], readout: Mapping[int, float]) -> dict[int, float]:
     """Find next-token probabilities when only the allowed tokens may be chosen.
 
-    Supply raw logits in ``readout`` and the permitted token IDs in ``allowed``.
-    Return an ID-to-natural-log-probability dictionary, normalized over distinct
-    allowed IDs only, not the full vocabulary.
+    Probabilities are normalized over distinct allowed IDs only, not the full
+    vocabulary.
 
     One allowed token is forced with probability 1 and needs no score. If all
     allowed scores are ``-inf``, use a uniform token distribution; otherwise
-    individual ``-inf`` scores get zero mass. Missing or malformed branch scores
-    raise BackendReadoutError. An empty allowed set raises ValueError.
+    individual ``-inf`` scores get zero mass.
 
     When several tokens mean stopping, include each END ID alongside continuing
     tokens, then combine their returned log probabilities with logprob_sum.
 
-    Normalize logits, not already-normalized probabilities. Round only display:
+    Args:
+        allowed: Nonempty collection of permitted token IDs.
+        readout: Raw logits for each allowed ID, not ordinary probabilities.
+            May be empty when there is only one distinct allowed ID.
 
-    >>> logs = masked_logprobs([10, 20], {10: 2.0, 20: 1.0})
-    >>> {token: round(math.exp(value), 6) for token, value in logs.items()}
-    {10: 0.731059, 20: 0.268941}
-    >>> masked_logprobs([12], {})  # Forced: no score required.
-    {12: 0.0}
-    >>> fallback = masked_logprobs([10, 20], {10: -math.inf, 20: -math.inf})
-    >>> [round(math.exp(value), 6) for value in fallback.values()]
-    [0.5, 0.5]
+    Returns:
+        A mapping from each distinct allowed ID to its natural-log probability.
+
+    Raises:
+        ValueError: The allowed set is empty.
+        BackendReadoutError: A required branch score is missing or malformed.
+
+    Examples:
+        Round only display output, not the returned log probabilities.
+
+        >>> logs = masked_logprobs([10, 20], {10: 2.0, 20: 1.0})
+        >>> {token: round(math.exp(value), 6) for token, value in logs.items()}
+        {10: 0.731059, 20: 0.268941}
+        >>> masked_logprobs([12], {})  # Forced: no score required.
+        {12: 0.0}
+        >>> fallback = masked_logprobs([10, 20], {10: -math.inf, 20: -math.inf})
+        >>> [round(math.exp(value), 6) for value in fallback.values()]
+        [0.5, 0.5]
     """
     tokens = tuple(dict.fromkeys(allowed))
     if not tokens:
@@ -209,15 +239,26 @@ def logsumexp(values: Iterable[float]) -> float:
     Supply natural-log weights and receive the natural log of their summed
     weight. This does not normalize the inputs: a positive result is valid
     when the total weight exceeds 1. For a normalized probability event, use
-    logprob_sum instead. Empty or all-``-inf`` input means zero total weight and
-    returns ``-inf``; NaN or positive infinity raises ValueError.
+    logprob_sum instead.
 
-    Two unit weights sum to 2, so their summed log weight is positive:
+    Args:
+        values: Natural-log weights, each finite or ``-inf``.
 
-    >>> round(logsumexp([0.0, 0.0]), 6)
-    0.693147
-    >>> logsumexp([])
-    -inf
+    Returns:
+        The natural log of the summed weight, or ``-inf`` for empty or
+        all-zero-mass input.
+
+    Raises:
+        TypeError: An input is not a real number.
+        ValueError: An input is NaN, positive infinity, or outside the numeric range.
+
+    Examples:
+        Two unit weights sum to 2, so their summed log weight is positive.
+
+        >>> round(logsumexp([0.0, 0.0]), 6)
+        0.693147
+        >>> logsumexp([])
+        -inf
     """
     weights = tuple(_log_weight(value, "log weight") for value in values)
     if not weights or all(value == -math.inf for value in weights):
@@ -234,17 +275,29 @@ def logprob_sum(values: Iterable[float]) -> float:
     example, multiple END tokens can all represent choosing to stop.
 
     Input logs must be nonpositive, and event mass must not exceed 1 beyond
-    relative tolerance 1e-12. Violations raise ValueError. Tiny positive output
-    caused by roundoff is bounded at 0; negative logs are preserved. Empty or
-    all-zero-mass events return ``-inf``.
+    relative tolerance 1e-12. Tiny positive output caused by roundoff is bounded
+    at 0; negative logs are preserved.
 
-    Two END tokens compete with one continuation token. Group only after
-    normalizing all three distinct IDs:
+    Args:
+        values: Nonpositive natural-log probabilities of mutually exclusive outcomes.
 
-    >>> steps = masked_logprobs([11, 99, 100], {11: 0.0, 99: 0.0, 100: 0.0})
-    >>> stopping = logprob_sum(steps[token] for token in (99, 100))
-    >>> round(math.exp(stopping), 6)
-    0.666667
+    Returns:
+        The event's natural-log probability, or ``-inf`` for empty or
+        all-zero-mass input.
+
+    Raises:
+        TypeError: An input is not a real number.
+        ValueError: An input is an invalid log probability or total mass exceeds
+            1 beyond the normalization tolerance.
+
+    Examples:
+        Two END tokens compete with one continuation token. Group only after
+        normalizing all three distinct IDs.
+
+        >>> steps = masked_logprobs([11, 99, 100], {11: 0.0, 99: 0.0, 100: 0.0})
+        >>> stopping = logprob_sum(steps[token] for token in (99, 100))
+        >>> round(math.exp(stopping), 6)
+        0.666667
     """
     probabilities = tuple(_log_weight(value, "log probability") for value in values)
     if any(value > 0 for value in probabilities):
@@ -264,23 +317,39 @@ def measurement_from_raw(raw: RawReadout) -> Measurement:
     a Measurement with probabilities, all exact winners, entropy in bits, and
     the three confidence summaries, preserving the input's candidate order.
 
-    At least two candidates and matching path keys are required. Implied
-    probability mass must sum to 1 within relative tolerance 1e-12; invalid
-    distributions raise ValueError rather than being renormalized. Raw logs
-    stay unchanged, including finite logs whose probabilities underflow.
+    Implied probability mass must sum to 1 within relative tolerance 1e-12,
+    without label-level renormalization. Raw logs stay unchanged, including
+    finite logs whose probabilities underflow.
     Confidence summaries lie in [0, 1], allowing for boundary roundoff.
 
-    >>> raw = RawReadout(
-    ...     {"A": math.log(0.6), "B": math.log(0.2), "C": math.log(0.2)},
-    ...     {"A": (10,), "B": (20,), "C": (30,)}, 7,
-    ... )
-    >>> result = measurement_from_raw(raw)
-    >>> result.top_labels
-    ('A',)
-    >>> tuple(round(value, 6) for value in (
-    ...     result.top_label_confidence, result.entropy_confidence, result.margin_confidence,
-    ... ))
-    (0.4, 0.135026, 0.4)
+    Args:
+        raw: Log probabilities for at least two candidates, with matching selected
+            path keys. Mapping order defines candidate order.
+
+    Returns:
+        A Measurement containing the vector, summaries, and an independent raw
+        snapshot.
+
+    Raises:
+        TypeError: A log credence is not a real number.
+        ValueError: Candidate/path keys are invalid, a log credence is invalid,
+            or the distribution is not normalized.
+
+    Examples:
+        >>> raw = RawReadout(
+        ...     {"A": math.log(0.6), "B": math.log(0.2), "C": math.log(0.2)},
+        ...     {"A": (10,), "B": (20,), "C": (30,)},
+        ...     7,
+        ... )
+        >>> result = measurement_from_raw(raw)
+        >>> result.top_labels
+        ('A',)
+        >>> round(result.top_label_confidence, 6)
+        0.4
+        >>> round(result.entropy_confidence, 6)
+        0.135026
+        >>> round(result.margin_confidence, 6)
+        0.4
     """
     if len(raw.credence_logprobs) < 2:
         raise ValueError("A measurement requires at least two candidates")
@@ -335,13 +404,27 @@ def choose_top_label(measurement: Measurement, *, rng: _ChoiceRng) -> str:
     generator. The distribution and winner set do not change; the supplied
     generator owns the random state.
 
-    >>> import random
-    >>> tied = measurement_from_raw(RawReadout(
-    ...     {"A": -math.log(2), "B": -math.log(2)},
-    ...     {"A": (10,), "B": (20,)}, 7,
-    ... ))
-    >>> choose_top_label(tied, rng=random.Random(7)) in tied.top_labels
-    True
+    Args:
+        measurement: Result whose exact winners are eligible for selection.
+        rng: Caller-owned generator with a uniform ``choice`` method.
+
+    Returns:
+        One member of the measurement's top_labels tuple.
+
+    Raises:
+        ValueError: The measurement has no top labels.
+
+    Examples:
+        >>> import random
+        >>> tied = measurement_from_raw(
+        ...     RawReadout(
+        ...         {"A": -math.log(2), "B": -math.log(2)},
+        ...         {"A": (10,), "B": (20,)},
+        ...         7,
+        ...     )
+        ... )
+        >>> choose_top_label(tied, rng=random.Random(7)) in tied.top_labels
+        True
     """
     if not measurement.top_labels:
         raise ValueError("A measurement must have at least one top label")
@@ -357,12 +440,25 @@ def top_label_weights(measurement: Measurement) -> dict[str, float]:
     For example, two winners with credence 0.4 each receive counting weight
     0.5 each. The measurement is unchanged. An empty winner set raises.
 
-    >>> result = measurement_from_raw(RawReadout(
-    ...     {"A": math.log(0.4), "B": math.log(0.4), "C": math.log(0.2)},
-    ...     {"A": (10,), "B": (20,), "C": (30,)}, 7,
-    ... ))
-    >>> top_label_weights(result)
-    {'A': 0.5, 'B': 0.5}
+    Args:
+        measurement: Result whose exact winners contribute to the count.
+
+    Returns:
+        Winner-to-counting-weight mapping in top_labels order; weights sum to 1.
+
+    Raises:
+        ValueError: The measurement has no top labels.
+
+    Examples:
+        >>> result = measurement_from_raw(
+        ...     RawReadout(
+        ...         {"A": math.log(0.4), "B": math.log(0.4), "C": math.log(0.2)},
+        ...         {"A": (10,), "B": (20,), "C": (30,)},
+        ...         7,
+        ...     )
+        ... )
+        >>> top_label_weights(result)
+        {'A': 0.5, 'B': 0.5}
     """
     if not measurement.top_labels:
         raise ValueError("A measurement must have at least one top label")

@@ -10,18 +10,19 @@ The caller owns tokenization and model calls. This module does no inference,
 generation, or caching. Scores must be finite float32-range logits or -inf,
 supplied as Python floats; probability calculations use higher precision.
 
->>> forms = {
-...     "yes": CandidatePaths((10,), (30,)),
-...     "no": CandidatePaths((20,), (40,)),
-... }
->>> validate_potential_paths(forms)
->>> first_token_ids(forms)
-(10, 20, 30, 40)
->>> initial = {10: 2.0, 30: 1.0, 20: 2.0, 40: 1.0}
->>> plan = build_trie(select_paths(forms, initial))
->>> logs = plan.score({(): initial})
->>> {label: round(math.exp(value), 3) for label, value in logs.items()}
-{'yes': 0.5, 'no': 0.5}
+Examples:
+    >>> forms = {
+    ...     "yes": CandidatePaths((10,), (30,)),
+    ...     "no": CandidatePaths((20,), (40,)),
+    ... }
+    >>> validate_potential_paths(forms)
+    >>> first_token_ids(forms)
+    (10, 20, 30, 40)
+    >>> initial = {10: 2.0, 30: 1.0, 20: 2.0, 40: 1.0}
+    >>> plan = build_trie(select_paths(forms, initial))
+    >>> logs = plan.score({(): initial})
+    >>> {label: round(math.exp(value), 3) for label, value in logs.items()}
+    {'yes': 0.5, 'no': 0.5}
 """
 
 import math
@@ -36,7 +37,7 @@ type TokenPath = tuple[int, ...]
 
 @dataclass(frozen=True, init=False)
 class CandidatePaths:
-    """Supply the two complete encoded continuations for one candidate.
+    """Tokenizations of the exact and additional-space forms of one answer.
 
     A token path is the sequence of model token IDs representing an answer
     after the fixed prompt context.
@@ -55,18 +56,34 @@ class CandidatePaths:
     ``"it"``, and ``"ive"`` with IDs [973, 184, 1784], while encoding
     ``" positive"`` as one token [17384]. These are invented vocabulary entries:
 
-    >>> forms = {
-    ...     "positive": CandidatePaths((973, 184, 1784), (17384,)),
-    ...     "negative": CandidatePaths((42, 43), (84,)),
-    ... }
-    >>> select_paths(forms, {973: 1.0, 17384: 2.0, 42: 2.0, 84: 1.0})
-    {'positive': (17384,), 'negative': (42, 43)}
+    Attributes:
+        bare: Complete, nonempty token path for the exact candidate text.
+        spaced: Complete, nonempty token path for one additional ASCII space
+            followed by the candidate text.
+
+    Examples:
+        >>> forms = {
+        ...     "positive": CandidatePaths((973, 184, 1784), (17384,)),
+        ...     "negative": CandidatePaths((42, 43), (84,)),
+        ... }
+        >>> select_paths(forms, {973: 1.0, 17384: 2.0, 42: 2.0, 84: 1.0})
+        {'positive': (17384,), 'negative': (42, 43)}
     """
 
     bare: TokenPath
     spaced: TokenPath
 
     def __init__(self, bare: Sequence[int], spaced: Sequence[int]) -> None:
+        """Copy and validate both complete continuation paths.
+
+        Args:
+            bare: Token IDs for the exact candidate text.
+            spaced: Token IDs for the candidate text with one additional ASCII space.
+
+        Raises:
+            TypeError: A path is not a sequence of token IDs.
+            ValueError: A path is empty or contains IDs that are not nonnegative integers.
+        """
         # Validate nonempty token-ID sequences and copy them so caller edits
         # cannot change the continuations held by this frozen object.
         object.__setattr__(self, "bare", _token_path(bare))
@@ -75,7 +92,7 @@ class CandidatePaths:
 
 @dataclass(frozen=True)
 class ReadoutRequest:
-    """Describe which next-token logits to request and where to request them.
+    """The tokens to score at a particular answer-continuation prefix.
 
     Append ``prefix`` to the unchanged fixed context, then request every
     token ID in ``wanted`` there. Prefixes are continuation tokens, not full
@@ -85,10 +102,17 @@ class ReadoutRequest:
     Plans use ``prefix=()`` for a root branch, whose scores can be reused from
     the initial form-selection readout.
 
-    >>> context = (7, 8)
-    >>> request = ReadoutRequest(prefix=(10,), wanted=(11, 99, 100))
-    >>> context + request.prefix, request.wanted
-    ((7, 8, 10), (11, 99, 100))
+    Attributes:
+        prefix: Continuation tokens to append to the unchanged fixed context;
+            an empty prefix requests scores at the root.
+        wanted: Distinct token IDs whose logits must all be supplied at that prefix,
+            including any END tokens.
+
+    Examples:
+        >>> context = (7, 8)
+        >>> request = ReadoutRequest(prefix=(10,), wanted=(11, 99, 100))
+        >>> context + request.prefix, request.wanted
+        ((7, 8, 10), (11, 99, 100))
     """
 
     prefix: TokenPath
@@ -97,12 +121,10 @@ class ReadoutRequest:
 
 @dataclass(frozen=True)
 class TriePlan:
-    """An immutable readout plan for scoring already-selected answer paths.
+    """An immutable plan for scoring selected candidate answers.
 
     Obtain a plan with build_trie, supply the scores requested by ``readouts``,
-    and call score for natural-log credences. ``paths`` retains the complete
-    selected continuations in candidate order; ``end_tokens`` holds the
-    stopping-token set (END).
+    and call score for natural-log credences.
 
     Readouts are in deterministic parent-first prefix order. Singleton
     transitions are forced with probability 1, and leaves stop without an
@@ -110,10 +132,17 @@ class TriePlan:
     prefixes used for later requests. Plans contain no context, scores, or
     model state and perform no inference or caching.
 
-    >>> plan = build_trie({"up": (10,), "down": (20,)})
-    >>> logs = plan.score({(): {10: 2.0, 20: 2.0}})
-    >>> {label: round(math.exp(value), 3) for label, value in logs.items()}
-    {'up': 0.5, 'down': 0.5}
+    Attributes:
+        paths: Candidate labels paired with their complete selected continuations,
+            in candidate order.
+        end_tokens: Sorted, distinct stopping-token IDs (END).
+        readouts: Branch requests in deterministic parent-first prefix order.
+
+    Examples:
+        >>> plan = build_trie({"up": (10,), "down": (20,)})
+        >>> logs = plan.score({(): {10: 2.0, 20: 2.0}})
+        >>> {label: round(math.exp(value), 3) for label, value in logs.items()}
+        {'up': 0.5, 'down': 0.5}
     """
 
     paths: tuple[tuple[str, TokenPath], ...]
@@ -122,20 +151,25 @@ class TriePlan:
 
     @property
     def additional_readouts(self) -> tuple[ReadoutRequest, ...]:
-        """Return the requests still needed after the first-token readout.
+        """Non-root score requests still needed after the first-token readout.
 
         These are non-root branches only: request each at the fixed context
         plus its prefix. Reuse initial scores for any root request instead
         of querying the root again.
 
-        >>> plan = build_trie(
-        ...     {"up": (10,), "upward": (10, 11, 12), "down": (20,)},
-        ...     end_tokens=(99, 100),
-        ... )
-        >>> context = (7, 8)
-        >>> request, = plan.additional_readouts
-        >>> context + request.prefix, request.wanted
-        ((7, 8, 10), (11, 99, 100))
+        Returns:
+            Non-root branch requests, each to be queried at the fixed context plus
+            its continuation prefix.
+
+        Examples:
+            >>> plan = build_trie(
+            ...     {"up": (10,), "upward": (10, 11, 12), "down": (20,)},
+            ...     end_tokens=(99, 100),
+            ... )
+            >>> context = (7, 8)
+            >>> (request,) = plan.additional_readouts
+            >>> context + request.prefix, request.wanted
+            ((7, 8, 10), (11, 99, 100))
         """
         return tuple(request for request in self.readouts if request.prefix)
 
@@ -145,8 +179,8 @@ class TriePlan:
         Supply ``readouts[prefix][token_id]`` for every request in the plan.
         Keys are continuation prefixes, not the full contexts used to query
         the model. Reuse initial form-selection scores under ``()`` if the
-        selected root branches. Missing or invalid requested scores raise
-        BackendReadoutError, even on zero-probability paths; extras are ignored.
+        selected root branches. Every requested score is required, even on
+        zero-probability paths; extras are ignored.
 
         Each branch normalizes over its distinct allowed token IDs; all -inf
         scores give a uniform token distribution. Singleton steps are forced.
@@ -160,16 +194,32 @@ class TriePlan:
         Here equal stopping and continuation logits favor stopping 2:1
         because END contains two distinct tokens:
 
-        >>> plan = build_trie(
-        ...     {"up": (10,), "upward": (10, 11, 12), "down": (20,)},
-        ...     end_tokens=(99, 100),
-        ... )
-        >>> logs = plan.score({
-        ...     (): {10: 2.0, 20: 2.0},
-        ...     (10,): {11: 0.0, 99: 0.0, 100: 0.0},
-        ... })
-        >>> {label: round(math.exp(value), 3) for label, value in logs.items()}
-        {'up': 0.333, 'upward': 0.167, 'down': 0.5}
+        Args:
+            readouts: Next-token logits keyed by continuation prefix, then token ID.
+                Supply every requested score, using initial selection scores at
+                ``()`` when the selected root branches.
+
+        Returns:
+            Natural-log credences keyed by candidate label in candidate order.
+            Exact zero credence is represented by -inf.
+
+        Raises:
+            BackendReadoutError: A requested branch or token score is missing, or a
+                requested score is invalid.
+
+        Examples:
+            >>> plan = build_trie(
+            ...     {"up": (10,), "upward": (10, 11, 12), "down": (20,)},
+            ...     end_tokens=(99, 100),
+            ... )
+            >>> logs = plan.score(
+            ...     {
+            ...         (): {10: 2.0, 20: 2.0},
+            ...         (10,): {11: 0.0, 99: 0.0, 100: 0.0},
+            ...     }
+            ... )
+            >>> {label: round(math.exp(value), 3) for label, value in logs.items()}
+            {'up': 0.333, 'upward': 0.167, 'down': 0.5}
         """
         transitions = {}
         for request in self.readouts:
@@ -206,13 +256,26 @@ def first_token_ids(forms: Mapping[str, CandidatePaths]) -> tuple[int, ...]:
     once. This checks labels and path ownership, but use
     validate_potential_paths before inference to check stopping boundaries too.
 
-    >>> forms = {
-    ...     "up": CandidatePaths((10,), (30,)),
-    ...     "upward": CandidatePaths((10, 11, 12), (31,)),
-    ...     "down": CandidatePaths((20,), (40,)),
-    ... }
-    >>> first_token_ids(forms)  # Shared start 10 is requested only once.
-    (10, 20, 30, 31, 40)
+    Args:
+        forms: At least two nonempty candidate labels mapped to their named bare
+            and spaced continuation paths.
+
+    Returns:
+        Sorted, distinct first-token IDs from both forms of every candidate.
+
+    Raises:
+        TypeError: A candidate's forms are not supplied as CandidatePaths.
+        ValueError: Labels are invalid, fewer than two candidates are supplied,
+            or a complete path belongs to different labels.
+
+    Examples:
+        >>> forms = {
+        ...     "up": CandidatePaths((10,), (30,)),
+        ...     "upward": CandidatePaths((10, 11, 12), (31,)),
+        ...     "down": CandidatePaths((20,), (40,)),
+        ... }
+        >>> first_token_ids(forms)  # Shared start 10 is requested only once.
+        (10, 20, 30, 31, 40)
     """
     owners = _path_owners(_possible_paths(forms))
     return tuple(sorted({path[0] for path in owners}))
@@ -233,14 +296,32 @@ def select_paths(
     valid, including those of discarded forms; otherwise BackendReadoutError
     is raised. The caller obtains scores; this function does no inference.
 
-    >>> forms = {
-    ...     "upward": CandidatePaths((10, 11, 12), (31,)),
-    ...     "down": CandidatePaths((20,), (40,)),
-    ... }
-    >>> select_paths(forms, {10: 2.0, 31: 2.0, 20: 2.0, 40: 1.0})
-    {'upward': (10, 11, 12), 'down': (20,)}
-    >>> select_paths(forms, {10: 2.0, 31: 3.0, 20: 2.0, 40: 1.0})
-    {'upward': (31,), 'down': (20,)}
+    Args:
+        forms: At least two nonempty candidate labels mapped to their named bare
+            and spaced continuation paths.
+        first_scores: Logits for every distinct first token from both forms,
+            queried at the same unchanged fixed context.
+
+    Returns:
+        Candidate labels mapped to their chosen complete paths in candidate order.
+        Exact first-token ties choose the bare form.
+
+    Raises:
+        TypeError: A candidate's forms are not supplied as CandidatePaths.
+        ValueError: Labels are invalid, fewer than two candidates are supplied,
+            or a complete path belongs to different labels.
+        BackendReadoutError: Any required first-token score is missing or invalid,
+            including a score for a discarded form.
+
+    Examples:
+        >>> forms = {
+        ...     "upward": CandidatePaths((10, 11, 12), (31,)),
+        ...     "down": CandidatePaths((20,), (40,)),
+        ... }
+        >>> select_paths(forms, {10: 2.0, 31: 2.0, 20: 2.0, 40: 1.0})
+        {'upward': (10, 11, 12), 'down': (20,)}
+        >>> select_paths(forms, {10: 2.0, 31: 3.0, 20: 2.0, 40: 1.0})
+        {'upward': (31,), 'down': (20,)}
     """
     scores = validate_readout(first_token_ids(forms), first_scores)
     return {
@@ -260,20 +341,32 @@ def validate_potential_paths(
     tokens (END), distinct from the next continuation token at that boundary.
     Otherwise stopping and continuing could not be distinguished.
 
-    Invalid labels, collisions, or unusable stopping boundaries raise
-    ValueError; valid inputs return None. Prefix relationships between one
-    candidate's own forms need no END because only one form will be selected.
-    This checks token paths, not whether they decode to the intended text.
+    Prefix relationships between one candidate's own forms need no END because
+    only one form will be selected. This checks token paths, not whether they
+    decode to the intended text.
 
-    >>> forms = {
-    ...     "up": CandidatePaths((10,), (30,)),
-    ...     "upward": CandidatePaths((10, 11, 12), (31,)),
-    ... }
-    >>> validate_potential_paths(forms)
-    Traceback (most recent call last):
-        ...
-    ValueError: Prefix (10,) needs a nonempty END set
-    >>> validate_potential_paths(forms, end_tokens=(99, 100))
+    Args:
+        forms: At least two nonempty candidate labels mapped to their named bare
+            and spaced continuation paths.
+        end_tokens: Nonnegative integer stopping-token IDs, required at
+            cross-label prefix boundaries and disjoint from continuations there.
+            Duplicates are ignored.
+
+    Raises:
+        TypeError: A candidate's forms are not supplied as CandidatePaths.
+        ValueError: Labels, path ownership, stopping-token IDs, or stopping
+            boundaries are invalid.
+
+    Examples:
+        >>> forms = {
+        ...     "up": CandidatePaths((10,), (30,)),
+        ...     "upward": CandidatePaths((10, 11, 12), (31,)),
+        ... }
+        >>> validate_potential_paths(forms)
+        Traceback (most recent call last):
+            ...
+        ValueError: Prefix (10,) needs a nonempty END set
+        >>> validate_potential_paths(forms, end_tokens=(99, 100))
     """
     ends = _end_tokens(end_tokens)
     owners = _path_owners(_possible_paths(forms))
@@ -307,12 +400,28 @@ def build_trie(paths: Mapping[str, Sequence[int]], *, end_tokens: Iterable[int] 
     Here the only later request distinguishes stopping at ``"up"`` from
     continuing to ``"upward"``; the final token 12 needs no score:
 
-    >>> plan = build_trie(
-    ...     {"up": (10,), "upward": (10, 11, 12), "down": (20,)},
-    ...     end_tokens=(99, 100),
-    ... )
-    >>> plan.additional_readouts
-    (ReadoutRequest(prefix=(10,), wanted=(11, 99, 100)),)
+    Args:
+        paths: At least two nonempty candidate labels mapped to complete, nonempty
+            token-ID continuations after the same fixed context.
+        end_tokens: Nonnegative integer stopping-token IDs, required when one
+            selected path is a strict prefix of another. Duplicates are ignored.
+
+    Returns:
+        An immutable plan preserving candidate order and requesting only branch
+        scores for the selected paths.
+
+    Raises:
+        TypeError: A path is not a sequence of token IDs.
+        ValueError: Labels, token IDs, or path ownership are invalid; a path is
+            empty; or a stopping boundary has missing or overlapping END tokens.
+
+    Examples:
+        >>> plan = build_trie(
+        ...     {"up": (10,), "upward": (10, 11, 12), "down": (20,)},
+        ...     end_tokens=(99, 100),
+        ... )
+        >>> plan.additional_readouts
+        (ReadoutRequest(prefix=(10,), wanted=(11, 99, 100)),)
     """
     _validate_labels(paths)
     selected = tuple((label, _token_path(path)) for label, path in paths.items())

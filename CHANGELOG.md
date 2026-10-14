@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Adopt Google-style API docstrings and explicit Ruff formatting/lint conventions.
+  Add ty as a locked development dependency and check library types in ordinary CI.
 - Refocus API docstrings on purpose, context, input/output meaning, and usage.
   Explain whitespace-dependent candidate tokenization, and keep non-obvious
   implementation rationale in concise code comments instead.

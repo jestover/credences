@@ -18,11 +18,12 @@ class BackendReadoutError(CredencesError):
     top-scoring tokens. NaN and positive infinity are invalid; negative infinity
     is a valid zero weight.
 
-    Missing scores are errors, not zero weights:
+    Examples:
+        Missing scores are errors, not zero weights.
 
-    >>> from credences.probabilities import validate_readout
-    >>> validate_readout([10, 20], {10: 2.0})
-    Traceback (most recent call last):
-        ...
-    credences.errors.BackendReadoutError: Missing requested score for token 20
+        >>> from credences.probabilities import validate_readout
+        >>> validate_readout([10, 20], {10: 2.0})
+        Traceback (most recent call last):
+            ...
+        credences.errors.BackendReadoutError: Missing requested score for token 20
     """

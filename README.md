@@ -16,6 +16,13 @@ They explain API purpose and usage; the walkthrough connects multiple objects,
 and sparse code comments explain non-obvious implementation choices.
 The normal test command checks both, alongside the behavioral tests.
 
+## Style conventions
+
+Use [Google-style API docstrings and the project code conventions](docs/style.md).
+Ruff handles formatting, imports, naming, common mistakes, annotations, and
+docstring structure. `ty` checks shipped library code; examples and deliberately
+malformed test inputs remain covered by runtime tests.
+
 ## Development setup
 
 This is a Python >= 3.14 library, initialized with `uv init --lib` and built with
@@ -26,6 +33,7 @@ Development uses Python 3.14.8, pinned in `.python-version` and managed by uv.
 uv sync --locked --group dev
 uv run ruff check .
 uv run ruff format --check .
+uv run ty check
 uv run lint-imports
 uv run pytest
 uv build
@@ -49,7 +57,7 @@ local changes or diverges, resolve them deliberately rather than resetting or
 forcing an update. Its local-only `backup/original-scaffold` branch preserves
 the files present before the initial synchronization.
 
-The `dev` group includes pytest, Hypothesis, Ruff, and import-linter. The package
+The `dev` group includes pytest, Hypothesis, Ruff, ty, and import-linter. The package
 has no runtime dependencies yet; model and DataFrame integrations will be optional
 extras as they are implemented. No model weights are needed for the pure core.
 

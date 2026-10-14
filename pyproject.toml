@@ -20,6 +20,44 @@ target-version = "py314"
 line-length = 100
 extend-exclude = ["*.md"]
 
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+[tool.ruff.lint]
+select = [
+    "E4", "E7", "E9",  # Structural Python errors; the formatter handles layout.
+    "F",              # Undefined names, unused imports, and similar mistakes.
+    "I",              # Deterministic import ordering.
+    "UP",             # Modern syntax for the supported Python version.
+    "B",              # Common bug patterns, including mutable defaults.
+    "N",              # PEP 8 naming conventions.
+    "ANN",            # Annotated library interfaces and helpers.
+    "D",              # Google-style API docstrings.
+    "D400", "D401",    # Periods and imperative function summaries.
+    "RUF100",         # Remove suppressions that no longer suppress anything.
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Fixtures deliberately contain malformed inputs; avoid annotation/doc boilerplate.
+"tests/**" = ["ANN", "D"]
+
+[tool.ty.environment]
+python-version = "3.14"
+
+[tool.ty.src]
+include = ["src"]
+
+[tool.ty.rules]
+unused-ignore-comment = "error"
+
+[tool.ty.terminal]
+error-on-warning = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
@@ -53,4 +91,5 @@ dev = [
     "import-linter>=2.15",
     "pytest>=9.1.1",
     "ruff>=0.16.10",
+    "ty>=0.0.20,<0.1",
 ]

@@ -91,9 +91,10 @@ approximate silently.
   documentation. Docstrings, code comments, and test explanations must describe
   behavior directly; do not cite `SPEC.md`, `DECISIONS.md`, or `PLAN.md`. References
   to durable package documentation or other code are fine.
-- Docstrings target API users: explain what an object or operation is for, why
-  it is useful, what inputs/outputs mean, and how to use it. Examples should show
-  representative usage, not demonstrate constructor or loop mechanics.
+- Use **Google-style docstrings** with `Args`, `Returns`/`Yields`, `Raises`,
+  `Attributes`, and `Examples` sections where applicable. They target API users:
+  explain purpose, input/output meaning, and representative usage, not constructor
+  or loop mechanics. Types live in annotations; prose adds semantics and constraints.
   Non-obvious implementation rationale belongs in sparse code comments; avoid
   line-by-line narration and comment tutorials.
 - Include small runnable examples for non-obvious core behavior, and a shared
@@ -120,6 +121,22 @@ approximate silently.
   a per-measurement metadata class (`DECISIONS.md` D13). Bypass remains an explicit
   constructor option; do not repeat it on every result.
 
+## Code style and static checks
+
+Follow `docs/style.md` and the explicit settings in `pyproject.toml`.
+
+- Ruff formatting is authoritative: four spaces, double quotes, and a 100-column
+  target, including formatting code examples in docstrings.
+- Use PEP 8 naming, sorted imports, and modern Python 3.14 syntax. Do not enable
+  `ALL` or rewrite clear probability math to satisfy speculative style preferences.
+- Annotate library functions and methods. `uv run ty check` checks `src/`;
+  warnings and unused ignores fail. Fix inaccurate types rather than masking
+  diagnostics with blanket ignores or `Any`.
+- Tests keep ordinary lint checks but are exempt from required annotations and
+  docstrings. Deliberately invalid test inputs stay outside the default ty target.
+- Static checks do not replace runtime score validation, property tests, or
+  tokenizer boundary tests.
+
 ## Tests
 
 Three tiers (SPEC §14): Hypothesis property tests on the pure core (fake backend);
@@ -137,6 +154,7 @@ uv run pytest                               # Tiers 1-2 (fast; no model weights)
 CREDENCES_RUN_MLX_TESTS=1 uv run pytest       # Tier 3 opt-in real-model e2e
 uv run ruff check .
 uv run ruff format .
+uv run ty check                            # shipped-library type check
 uv run lint-imports                         # dependency-tier check
 uv build                                   # build the library distribution
 ```
