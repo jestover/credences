@@ -50,7 +50,8 @@ convention = "google"
 python-version = "3.14"
 
 [tool.ty.src]
-include = ["src"]
+# fakes.py is checked so the test doubles cannot drift from the real interfaces.
+include = ["src", "tests/fakes.py"]
 
 [tool.ty.rules]
 unused-ignore-comment = "error"
@@ -68,7 +69,12 @@ include_external_packages = true
 [[tool.importlinter.contracts]]
 name = "Pure measurement core stays tokenizer- and backend-free"
 type = "forbidden"
-source_modules = ["credences.probabilities", "credences.errors", "credences.trie"]
+source_modules = [
+    "credences.errors",
+    "credences.probabilities",
+    "credences.trie",
+    "credences.types",
+]
 forbidden_modules = [
     "credences.tokenization",
     "credences.reasoning",
@@ -78,6 +84,21 @@ forbidden_modules = [
     "credences.frames",
     "transformers",
     "tokenizers",
+    "mlx",
+    "mlx_lm",
+    "torch",
+    "pandas",
+    "polars",
+]
+
+[[tool.importlinter.contracts]]
+name = "Tokenizer code never runs a model"
+type = "forbidden"
+source_modules = ["credences.tokenization"]
+forbidden_modules = [
+    "credences.credoscope",
+    "credences.backends",
+    "credences.frames",
     "mlx",
     "mlx_lm",
     "torch",

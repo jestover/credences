@@ -22,6 +22,9 @@ Early development. The package is not yet on PyPI.
 - **Available now:** the scoring math and result types. Given the token IDs
   for each answer and a model's logits (raw next-token scores), `credences`
   computes each answer's probability, confidence summaries, and JSON output.
+  The interfaces a model backend and its tokenizer will implement
+  (`credences.backends.FullLogitsBackend`, `credences.tokenization.Tokenizer`)
+  and the chat message types (`credences.types`) are defined too.
 - **Not yet available:** tokenizing answers, loading a model, and a one-call
   measurement API. The planned API looks like this:
 

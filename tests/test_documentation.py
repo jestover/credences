@@ -5,11 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from credences import errors, probabilities, trie
+from credences import errors, probabilities, trie, types
 
 
 @pytest.mark.parametrize(
-    "module", [errors, probabilities, trie], ids=lambda module: module.__name__
+    "module", [errors, probabilities, trie, types], ids=lambda module: module.__name__
 )
 def test_core_docstring_examples_execute_without_drift(module):
     result = doctest.testmod(module)

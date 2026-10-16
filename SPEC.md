@@ -1095,17 +1095,21 @@ The tokenizer adapter exposes:
 
 ```python
 class Tokenizer(Protocol):
-    def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]: ...
-    def decode(self, ids: Sequence[int], *, skip_special_tokens: bool = False,
-               clean_up_tokenization_spaces: bool = False) -> str: ...
-    def apply_chat_template(self, messages, *, tokenize: bool = False,
-                            add_generation_prompt: bool = True,
-                            continue_final_message: bool = False,
+    def encode(self, text: str, /, *, add_special_tokens: bool) -> list[int]: ...
+    def decode(self, ids: Sequence[int], /, *, skip_special_tokens: bool,
+               clean_up_tokenization_spaces: bool) -> str: ...
+    def apply_chat_template(self, messages, /, *, tokenize: bool,
+                            add_generation_prompt: bool,
+                            continue_final_message: bool,
                             **chat_template_kwargs): ...
     eos_token_id: int | None
     chat_template: str | None
     additional_special_tokens: list[str]
 ```
+
+The protocol declares no defaults. Tokenizer libraries disagree on them (Hugging
+Face adds special tokens and tokenizes chat templates by default), so every call
+passes each flag explicitly and any tokenizer accepting these keywords conforms.
 
 The model profile chooses compatible rendering flags; do not open a new assistant
 turn and continue a final message simultaneously. The adapter preserves the

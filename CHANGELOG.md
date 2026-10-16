@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Complete Phase 1: add chat message types with structural validation
+  (`credences.types`), the `Tokenizer` and `FullLogitsBackend` interfaces, and a
+  protocol-conforming fake tokenizer and backend for tests. ty checks the fakes
+  against the interfaces, and import-linter now keeps `credences.tokenization`
+  free of model runtimes.
+- Clarify SPEC §10.2: the `Tokenizer` protocol declares no default arguments.
+  Hugging Face tokenizers default to adding special tokens, so relying on
+  defaults could silently put a beginning-of-text token into an answer path;
+  callers pass every flag explicitly instead.
 - Rewrite the README, docstrings, and pure-core walkthrough for readers new to
   the project: what the package does and why, plain-language definitions,
   and fewer internal terms. Move checkout-synchronization notes from the README
