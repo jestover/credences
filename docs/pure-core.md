@@ -5,45 +5,44 @@ model. They show the lower-level building blocks that the planned model-backed
 API will run for you; that API is not implemented yet. Run the snippets on this
 page in order.
 
-The measurement design now adds the probabilities of both spellings of each
-answer. The building blocks shown here still choose one spelling, and this page
-will be updated when they change.
-
 `>>>` and `...` mark interactive Python input; unprefixed lines are expected
 output. To turn a snippet into a script, remove the prompts and output lines.
 
 Outputs are rounded here only for readability; the library itself never rounds.
 `uv run pytest` runs every example on this page, so they stay in step with the code.
 
-## 1. From two forms per candidate to a scored trie
+## 1. From two spellings per answer to a scored trie
 
-### Why keep two token paths?
+### Why two spellings?
 
-Leading spaces can change how a tokenizer represents an answer. A hypothetical
-tokenizer might split `"positive"` into `"pos"`, `"it"`, and `"ive"` with IDs
-`[973, 184, 1784]`, while encoding `" positive"` as one token `[17384]`. The two
-forms can therefore differ in both length and token IDs, not just their first
+A space in front of a word usually changes how a tokenizer encodes it. A
+hypothetical tokenizer might split `"positive"` into `"pos"`, `"it"`, and `"ive"`
+with IDs `[973, 184, 1784]`, while encoding `" positive"` as one token `[17384]`.
+The two spellings can differ in both length and token IDs, not just their first
 piece.
 
-`CandidatePaths` holds both encodings: `bare` is the answer exactly as
-written, and `spaced` is the answer with one space in front. Encode both as
-they would appear right after the prompt. For each answer, the model's
-first-token logits decide which version is scored. That choice only decides how
-the answer is represented; it does not change the answer's probability. The
-class stores token IDs you supply; it does not tokenize text.
+Whether a model writes that space depends on what comes before the answer:
+right after a chat header that ends in a newline, answers usually start without
+one; after `"Answer:"`, they usually start with one. So credences scores both
+spellings and gives each answer their **total** probability.
+
+`CandidatePaths` holds both encodings: `bare` is the answer exactly as written,
+and `spaced` is the answer with one space in front. Encode each one together
+with the prompt, the way the model would see the full text, and keep the tokens
+after the prompt. The class stores token IDs you supply; it does not tokenize
+text.
 
 ### A small example
 
 For illustration, let `10` represent `"up"`, `11` represent `"war"`, `12`
-represent `"d"`, and `20` represent `"down"`. The spaced forms use single IDs
-`30`, `31`, and `40`. END IDs `99` and `100` both mean stopping.
+represent `"d"`, and `20` represent `"down"`. The spaced spellings use single
+IDs `30` (`" up"`), `31` (`" upward"`), and `40` (`" down"`). END IDs `99` and
+`100` both mean stopping.
 
 ```pycon
 >>> import math
->>> from credences.trie import (
-...     CandidatePaths, build_trie, first_token_ids, select_paths,
-...     validate_potential_paths,
-... )
+>>> from credences.probabilities import TokenScores
+>>> from credences.trie import CandidatePaths, build_trie
 >>> forms = {
 ...     "up": CandidatePaths(bare=[10], spaced=[30]),
 ...     "upward": CandidatePaths(bare=[10, 11, 12], spaced=[31]),
@@ -57,45 +56,16 @@ represent `"d"`, and `20` represent `"down"`. The spaced forms use single IDs
 The IDs are stored as tuples. Nothing checks that they spell the intended
 words; that needs a tokenizer.
 
-Before asking the model for anything, check **both** encodings of every answer.
-The bare `"up"` path ends where the bare `"upward"` path continues, so the
-model must be able to signal "stop" with END tokens, here IDs `99` and `100`.
+`build_trie` checks every spelling and plans the model calls, before any model
+is run. The bare `"up"` path ends where the bare `"upward"` path continues, so the
+model must be able to signal "stop" with END tokens.
 
 ```pycon
->>> end_tokens = [100, 99, 99]
->>> validate_potential_paths(forms, end_tokens=end_tokens)
->>> first_token_ids(forms)
-(10, 20, 30, 31, 40)
-
-```
-
-Six encodings need only five first-token scores, because two start with `10`.
-Suppose your prompt encodes to the tokens `C`. Ask the model for its logits
-right after `C`, with no answer tokens added.
-
-```pycon
->>> C = (700, 701)
->>> first_scores = {10: 2.0, 20: 2.0, 30: 1.0, 31: 0.0, 40: 1.0}
->>> selected = select_paths(forms, first_scores)
->>> selected
-{'up': (10,), 'upward': (10, 11, 12), 'down': (20,)}
-
-```
-
-These are **logits** (raw scores), so they can be positive. Here the bare
-version wins for every answer. Each answer keeps its whole chosen encoding, and
-on an exact tie the bare version wins.
-
-Plan the scoring for the chosen paths:
-
-```pycon
->>> plan = build_trie(selected, end_tokens=end_tokens)
->>> plan.paths
-(('up', (10,)), ('upward', (10, 11, 12)), ('down', (20,)))
+>>> plan = build_trie(forms, end_tokens=[100, 99, 99])
 >>> plan.end_tokens
 (99, 100)
 >>> [(request.prefix, request.wanted) for request in plan.readouts]
-[((), (10, 20)), ((10,), (11, 99, 100))]
+[((), (10, 20, 30, 31, 40)), ((10,), (11, 99, 100))]
 
 ```
 
@@ -103,67 +73,86 @@ The plan contains **requests, not scores**:
 
 | Prefix | Decision |
 |---|---|
-| `()` | Choose `10` or `20`; `10` starts both `"up"` and `"upward"` but is scored once |
+| `()` | Choose among all five first tokens; `10` starts both `"up"` and `"upward"` but is scored once |
 | `(10,)` | Continue with `11`, or stop with END `99` or `100` |
 | `(10, 11)` | Only `12` is possible, so no score is needed |
 
-An answer that no other answer continues needs no stopping score. Repeated END
-IDs count once.
+Repeated END IDs count once. The plan depends only on the token paths, so it
+can be shown before measuring and reused for any prompt with the same paths.
 
-The scores right after the prompt are already in hand, so only the request at
-`(10,)` needs another model call. Make it after the prompt **plus the full
-prefix**:
+Suppose your prompt encodes to the tokens `C`. Each request is made after
+`C` **plus the full prefix**:
 
 ```pycon
->>> [(C + request.prefix, request.wanted) for request in plan.additional_readouts]
-[((700, 701, 10), (11, 99, 100))]
->>> readouts = {
-...     (): first_scores,
-...     (10,): {11: 0.0, 99: 0.0, 100: 0.0},
-... }
->>> logs = plan.score(readouts)
->>> {label: round(math.exp(value), 6) for label, value in logs.items()}
-{'up': 0.333333, 'upward': 0.166667, 'down': 0.5}
+>>> C = (700, 701)
+>>> [(C + request.prefix, request.wanted) for request in plan.readouts]
+[((700, 701), (10, 20, 30, 31, 40)), ((700, 701, 10), (11, 99, 100))]
 
 ```
 
-`plan.readouts` says where scores are needed. The `readouts` argument to
-`score` supplies them, keyed by the prefix after the prompt (not including `C`).
+The model answers each request with `TokenScores`: the requested **logits**
+(raw scores, which can be positive) and its **log normalizer**, the logsumexp of
+the logits over its whole vocabulary. Only the coverage diagnostic uses the
+normalizer.
 
-Each label's probability is the product of the steps along its path:
+```pycon
+>>> scores = {
+...     (): TokenScores({10: 2.0, 20: 2.0, 30: 1.0, 31: 0.0, 40: 1.0}, log_normalizer=4.0),
+...     (10,): TokenScores({11: 0.0, 99: 0.0, 100: 0.0}, log_normalizer=2.0),
+... }
+>>> raw = plan.score(scores, context_token_count=len(C))
+>>> {label: round(math.exp(value), 6) for label, value in raw.credence_logprobs.items()}
+{'up': 0.360332, 'upward': 0.163237, 'down': 0.476431}
+
+```
+
+Each answer's credence adds up its spellings:
+
+```pycon
+>>> [(path.spellings, round(math.exp(path.logprob), 6)) for path in raw.scored_paths["up"]]
+[(('bare',), 0.2322), (('spaced',), 0.128132)]
+
+```
 
 | Label | Probability calculation |
 |---|---|
-| `"up"` | First token `1/2` times stopping probability (either END token) `2/3` |
-| `"upward"` | First token `1/2` times continuing probability `1/3`; the last step, `12`, has probability 1 |
-| `"down"` | First token `1/2`; nothing else starts with `20` |
+| `"up"` | Token `10` (0.348) times stopping (either END token, 2/3), plus token `30` (0.128) |
+| `"upward"` | Token `10` times continuing (1/3), with `12` then certain, plus token `31` (0.047) |
+| `"down"` | Token `20` (0.348) plus token `40` (0.128) |
 
-`score` adds log probabilities, which is the same as multiplying
-probabilities. The results already sum to 1, with no rescaling. A plan stores
-no prompt or scores, so you can reuse it for another prompt whenever
-`select_paths` chooses the same paths.
+`score` adds log probabilities, which is the same as multiplying probabilities.
+The results already sum to 1, with no rescaling.
 
-## 2. From log credences to results and JSON
-
-Continue with `logs`, `plan`, and `C` from the first section. The raw result
-records the token path scored for each label and the number of prompt tokens.
+`raw.coverage` is the model's unrestricted probability that its first answer
+token is one of the five allowed ones. It is a diagnostic about the model's
+habits, not about accuracy, and it never changes the credences:
 
 ```pycon
->>> from credences import RawReadout
->>> from credences.probabilities import measurement_from_raw
->>> raw = RawReadout(logs, dict(plan.paths), context_token_count=len(C))
->>> result = measurement_from_raw(raw)
->>> result.top_labels
-('down',)
->>> result.raw.scored_token_ids["upward"]
-(10, 11, 12)
->>> round(result.top_label_confidence, 6), round(result.margin_confidence, 6)
-(0.25, 0.166667)
+>>> round(raw.coverage, 6)
+0.38856
 
 ```
 
-`measurement_from_raw` checks that the credences sum to 1 and then computes
-the summaries. It never rescales or rounds the credences.
+## 2. From a raw readout to results and JSON
+
+Continue with `raw` from the first section. It records every scored path, the
+number of prompt tokens, and the coverage.
+
+```pycon
+>>> from credences.probabilities import measurement_from_raw
+>>> result = measurement_from_raw(raw)
+>>> result.top_labels
+('down',)
+>>> result.raw.scored_paths["upward"][0].token_ids
+(10, 11, 12)
+>>> round(result.top_label_confidence, 6), round(result.margin_confidence, 6)
+(0.214647, 0.1161)
+
+```
+
+`measurement_from_raw` checks that each answer's paths add up to its credence
+and that the credences sum to 1, then computes the summaries. It never rescales
+or rounds the credences.
 
 `to_dict()` returns a copy you can save as JSON:
 
@@ -173,7 +162,7 @@ the summaries. It never rescales or rounds the credences.
 >>> restored = json.loads(json.dumps(exported, allow_nan=False))
 >>> restored["top_labels"]
 ['down']
->>> restored["raw"]["scored_token_ids"]["upward"]
+>>> restored["raw"]["scored_paths"]["upward"][0]["token_ids"]
 [10, 11, 12]
 
 ```
@@ -189,9 +178,6 @@ True
 
 ```
 
-`RawReadout` itself does not copy, so `raw.credence_logprobs` and `logs` are
-the same dictionary; that edit changed `logs` too.
-
 ## 3. Exact ties and caller-owned randomness
 
 Here two labels tie for the highest credence. `top_label_weights` splits one
@@ -200,10 +186,13 @@ measurements. These weights are not credences.
 
 ```pycon
 >>> from credences import choose_top_label, top_label_weights
->>> tied = measurement_from_raw(RawReadout(
-...     {"A": math.log(0.4), "B": math.log(0.4), "C": math.log(0.2)},
-...     {"A": (10,), "B": (20,), "C": (30,)}, 7,
-... ))
+>>> forms = {label: CandidatePaths((i,), (i + 10,)) for i, label in enumerate("ABC")}
+>>> logits = {0: math.log(0.4), 1: math.log(0.4), 2: math.log(0.2)}
+>>> logits |= dict.fromkeys((10, 11, 12), -math.inf)
+>>> plan = build_trie(forms)
+>>> tied = measurement_from_raw(
+...     plan.score({(): TokenScores(logits, 0.0)}, context_token_count=7)
+... )
 >>> tied.top_labels
 ('A', 'B')
 >>> top_label_weights(tied)
@@ -246,10 +235,15 @@ A very small probability can round to 0.0, but its log credence stays finite,
 so it remains distinct from an answer with exactly zero probability:
 
 ```pycon
->>> tiny = measurement_from_raw(RawReadout(
-...     {"likely": 0.0, "tiny": -1000.0, "impossible": -math.inf},
-...     {"likely": (10,), "tiny": (20,), "impossible": (30,)}, 7,
-... ))
+>>> forms = {
+...     "likely": CandidatePaths((1,), (2,)),
+...     "tiny": CandidatePaths((3,), (4,)),
+...     "impossible": CandidatePaths((5,), (6,)),
+... }
+>>> logits = {1: 0.0, 3: -1000.0} | dict.fromkeys((2, 4, 5, 6), -math.inf)
+>>> tiny = measurement_from_raw(
+...     build_trie(forms).score({(): TokenScores(logits, 0.0)}, context_token_count=7)
+... )
 >>> tiny.credences
 {'likely': 1.0, 'tiny': 0.0, 'impossible': 0.0}
 >>> tiny.to_dict()["raw"]["credence_logprobs"]
@@ -257,6 +251,6 @@ so it remains distinct from an answer with exactly zero probability:
 
 ```
 
-In JSON, only exactly-zero log credences become `null`. Winners are found by
+In JSON, only exactly-zero log probabilities become `null`. Winners are found by
 comparing exact log credences, so two answers whose probabilities happen to
 round to the same float are not reported as tied.

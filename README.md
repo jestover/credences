@@ -24,9 +24,7 @@ Early development. The package is not yet on PyPI.
   computes each answer's probability, confidence summaries, and JSON output.
   The interfaces a model backend and its tokenizer will implement
   (`credences.backends.FullLogitsBackend`, `credences.tokenization.Tokenizer`)
-  and the chat message types (`credences.types`) are defined too. The scoring
-  code still keeps one spelling per answer; it is being updated to add both
-  spellings, as described in [How answers are scored](#how-answers-are-scored).
+  and the chat message types (`credences.types`) are defined too.
 - **Not yet available:** tokenizing answers, loading a model, and a one-call
   measurement API. The planned API looks like this:
 
@@ -83,12 +81,17 @@ The current version works on token IDs and logits you provide. Here, two
 one-token answers use made-up token IDs and logits:
 
 ```pycon
->>> from credences import RawReadout
->>> from credences.probabilities import measurement_from_raw
->>> from credences.trie import build_trie
->>> plan = build_trie({"yes": (10,), "no": (20,)})  # "yes" is token 10, "no" is 20
->>> logs = plan.score({(): {10: 2.0, 20: 1.0}})  # the model's logits for each token
->>> result = measurement_from_raw(RawReadout(logs, dict(plan.paths), context_token_count=12))
+>>> from credences.probabilities import TokenScores, measurement_from_raw
+>>> from credences.trie import CandidatePaths, build_trie
+>>> plan = build_trie(
+...     {
+...         "yes": CandidatePaths(bare=[10], spaced=[11]),  # "yes" is token 10, " yes" is 11
+...         "no": CandidatePaths(bare=[20], spaced=[21]),  # "no" is token 20, " no" is 21
+...     }
+... )
+>>> logits = {10: 2.0, 11: 0.5, 20: 1.0, 21: -0.5}  # the model's scores for each token
+>>> raw = plan.score({(): TokenScores(logits, log_normalizer=3.0)}, context_token_count=12)
+>>> result = measurement_from_raw(raw)
 >>> {label: round(p, 3) for label, p in result.credences.items()}
 {'yes': 0.731, 'no': 0.269}
 >>> result.top_labels
@@ -96,8 +99,7 @@ one-token answers use made-up token IDs and logits:
 
 ```
 
-For multi-token answers, the with-and-without-space choice, shared first
-tokens, and saving results, follow the
+For multi-token answers, shared first tokens, and saving results, follow the
 [walkthrough of the scoring core](docs/pure-core.md).
 
 ## What a measurement contains
@@ -117,8 +119,13 @@ p2:
 Each confidence summary runs from 0 to 1, and is 1 when one answer has all
 the probability.
 `measurement.raw` keeps the exact log probabilities, which stay meaningful even
-for answers too unlikely to show as anything but 0.0, and the token IDs scored
-for each answer. `measurement.to_dict()` gives a copy you can save as JSON.
+for answers too unlikely to show as anything but 0.0, and how much each spelling
+of each answer contributed. It also reports **coverage**: how likely the model
+was, before being limited to your answers, to start one of them. Coverage
+describes the model's habits, not the measurement's accuracy. A model that
+likes to open with "The" can have low coverage and exactly the same credences as
+one that answers directly. `measurement.to_dict()` gives a copy you can save as
+JSON.
 
 Ties are never broken silently. Use `choose_top_label(result, rng=...)` to pick
 one winner with your own random generator, or `top_label_weights(result)` to

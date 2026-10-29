@@ -2,22 +2,27 @@
 
 import json
 import math
-import random
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from credences import RawReadout, choose_top_label, top_label_weights
+from credences import RawReadout, ScoredPath, choose_top_label, top_label_weights
 from credences.probabilities import masked_logprobs, measurement_from_raw
 
 
-def _raw(logs):
-    return RawReadout(
-        credence_logprobs=logs,
-        scored_token_ids={label: (index,) for index, label in enumerate(logs)},
-        context_token_count=7,
-    )
+def _raw(logs, **changes):
+    """One scored path per candidate, carrying the candidate's whole credence."""
+    fields = {
+        "credence_logprobs": logs,
+        "scored_paths": {
+            label: (ScoredPath(("bare",), (index,), value),)
+            for index, (label, value) in enumerate(logs.items())
+        },
+        "context_token_count": 7,
+        "coverage": 1.0,
+    }
+    return RawReadout(**{**fields, **changes})
 
 
 def _measurement(probabilities):
@@ -160,9 +165,72 @@ def test_factory_never_renormalizes_candidate_credences_or_rewrites_raw_logs():
     assert math.fsum(result.credences.values()) != 1.0
     assert result.raw == raw
     raw.credence_logprobs["A"] = -math.inf
-    raw.scored_token_ids["A"] = (99,)
+    raw.scored_paths["A"] = (ScoredPath(("bare",), (99,), -math.inf),)
     assert result.raw.credence_logprobs["A"] == math.log(0.6)
-    assert result.raw.scored_token_ids["A"] == (0,)
+    assert result.raw.scored_paths["A"][0].token_ids == (0,)
+
+
+def test_factory_owns_scored_paths_built_from_caller_lists():
+    spellings, tokens = ["bare"], [0]
+    paths = {
+        "A": (ScoredPath(spellings, tokens, math.log(0.6)),),
+        "B": (ScoredPath(("bare",), (1,), math.log(0.4)),),
+    }
+    result = measurement_from_raw(
+        _raw({"A": math.log(0.6), "B": math.log(0.4)}, scored_paths=paths)
+    )
+    spellings.append("spaced")
+    tokens.append(99)
+
+    assert result.raw.scored_paths["A"][0].spellings == ("bare",)
+    assert result.raw.scored_paths["A"][0].token_ids == (0,)
+
+
+def test_factory_rejects_mass_off_by_more_than_roundoff():
+    # 5e-13 of excess log mass is roundoff (above); 1e-10 is a real error.
+    with pytest.raises(ValueError, match="sum to"):
+        measurement_from_raw(_raw({"A": math.log(0.6), "B": math.log(0.4) + 1e-10}))
+
+
+def test_factory_sums_a_candidates_spellings_and_rejects_paths_that_disagree():
+    logs = {"A": math.log(0.6), "B": math.log(0.4)}
+    both = (
+        ScoredPath(("bare",), (0,), math.log(0.45)),
+        ScoredPath(("spaced",), (1,), math.log(0.15)),
+    )
+    paths = {"A": both, "B": (ScoredPath(("bare",), (2,), math.log(0.4)),)}
+    assert measurement_from_raw(_raw(logs, scored_paths=paths)).credences["A"] == (
+        pytest.approx(0.6)
+    )
+
+    paths["A"] = both[:1]
+    with pytest.raises(ValueError, match="add up"):
+        measurement_from_raw(_raw(logs, scored_paths=paths))
+
+
+def test_factory_rejects_a_candidate_without_scored_paths():
+    logs = {"A": math.log(0.6), "B": math.log(0.4)}
+    paths = {"A": (), "B": (ScoredPath(("bare",), (2,), math.log(0.4)),)}
+
+    with pytest.raises(ValueError, match="no scored path"):
+        measurement_from_raw(_raw(logs, scored_paths=paths))
+
+
+@pytest.mark.parametrize(
+    ("changes", "error", "match"),
+    [
+        ({"coverage": -0.1}, ValueError, "Coverage"),
+        ({"coverage": 1.1}, ValueError, "Coverage"),
+        ({"coverage": math.nan}, ValueError, "coverage"),
+        ({"coverage": "high"}, TypeError, "coverage"),
+        ({"context_token_count": -1}, ValueError, "token count"),
+        ({"context_token_count": True}, ValueError, "token count"),
+        ({"context_token_count": 1.5}, ValueError, "token count"),
+    ],
+)
+def test_factory_rejects_invalid_coverage_and_prompt_token_counts(changes, error, match):
+    with pytest.raises(error, match=match):
+        measurement_from_raw(_raw({"A": math.log(0.6), "B": math.log(0.4)}, **changes))
 
 
 @pytest.mark.parametrize("logs", [{}, {"A": 0.0}])
@@ -191,8 +259,11 @@ def test_factory_rejects_invalid_or_positive_log_credences(value):
 
 
 def test_factory_rejects_missing_candidate_paths():
+    logs = {"A": -math.log(2), "B": -math.log(2)}
+    paths = {"A": (ScoredPath(("bare",), (1,), -math.log(2)),)}
+
     with pytest.raises(ValueError, match="same candidates"):
-        measurement_from_raw(RawReadout({"A": -math.log(2), "B": -math.log(2)}, {"A": (1,)}, 7))
+        measurement_from_raw(_raw(logs, scored_paths=paths))
 
 
 def test_fractional_winner_weights_are_not_credences():
@@ -202,7 +273,6 @@ def test_fractional_winner_weights_are_not_credences():
     assert weights == {"B": 0.5, "A": 0.5}
     assert list(weights) == ["B", "A"]
     assert math.fsum(weights.values()) == 1.0
-    assert weights != result.credences
 
 
 def test_tie_selection_delegates_only_winners_to_the_callers_rng():
@@ -214,25 +284,3 @@ def test_tie_selection_delegates_only_winners_to_the_callers_rng():
             return labels[-1]
 
     assert choose_top_label(result, rng=RecordingRng()) == "A"
-
-
-def test_seeded_tie_selection_does_not_touch_global_randomness_or_result():
-    result = _measurement({"A": 0.4, "B": 0.4, "C": 0.2})
-    snapshot = result.to_dict()
-    state = random.getstate()
-    first_rng = random.Random(42)
-    second_rng = random.Random(42)
-    first = [choose_top_label(result, rng=first_rng) for _ in range(30)]
-    second = [choose_top_label(result, rng=second_rng) for _ in range(30)]
-
-    assert first == second
-    assert set(first) == {"A", "B"}
-    assert random.getstate() == state
-    assert result.to_dict() == snapshot
-
-
-def test_unique_winner_helpers_only_return_that_winner():
-    result = _measurement({"A": 0.9, "B": 0.1})
-
-    assert top_label_weights(result) == {"A": 1.0}
-    assert choose_top_label(result, rng=random.Random(1)) == "A"

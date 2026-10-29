@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Implement summed spellings in the pure core (PLAN Phase 1b). `build_trie`
+  takes each candidate's `CandidatePaths`, checks them before any model call,
+  and plans readouts that always start at the scoring position; `TriePlan.score`
+  returns a `RawReadout` whose credences sum each candidate's distinct paths.
+  `select_paths`, `first_token_ids`, and `validate_potential_paths` are removed.
+  `RawReadout` now has `scored_paths` (`ScoredPath` records) and `coverage`, and
+  `measurement_from_raw` checks that paths add up to credences and validates
+  coverage and the prompt token count. Backends return `TokenScores` with a
+  validated full-vocabulary log normalizer. `ScoredPath` carries no answer text;
+  its spelling labels identify it, and preview will show it (SPEC §6 updated).
+- Replace tests that only exercised dataclass freezing or `random.Random`, and add
+  tests for the normalization tolerance and readout ordering.
 - Revise the measurement design (SPEC §4–§8, §10, §14; DECISIONS D3, D5, D14,
   D16; AGENTS): candidates are trimmed at the ends; each candidate's credence is
   the sum of its bare and single-space spellings, scored in one trie, replacing
@@ -11,8 +23,7 @@
   chat templates trim; and `RawReadout` gains per-path probabilities and a
   `coverage` diagnostic, which needs the backend to return a full-vocabulary log
   normalizer. Based on tests of nine tokenizer families and Geh et al. (EMNLP
-  2024). The pure core still implements selection; PLAN Phase 1b brings the code
-  in line.
+  2024).
 - Complete Phase 1: add chat message types with structural validation
   (`credences.types`), the `Tokenizer` and `FullLogitsBackend` interfaces, and a
   protocol-conforming fake tokenizer and backend for tests. ty checks the fakes

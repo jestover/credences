@@ -3,10 +3,12 @@
 This module has two parts:
 
 - Helpers that turn a model's raw next-token scores into probabilities when
-  only a few tokens are allowed: masked_logprobs, logprob_sum, logsumexp, and
-  validate_readout.
-- The result of a measurement: Measurement and RawReadout, the
-  measurement_from_raw function that builds them, and two helpers for ties.
+  only a few tokens are allowed: masked_logprobs, logprob_sum, logsumexp,
+  validate_readout, and validate_token_scores. TokenScores is what a model
+  backend reports, and coverage computes the diagnostic of the same name.
+- The result of a measurement: Measurement, RawReadout and ScoredPath, the
+  measurement_from_raw function that builds a Measurement, and two helpers
+  for ties.
 
 Nothing here runs a model; every function works on numbers you supply.
 
@@ -32,6 +34,63 @@ from .errors import BackendReadoutError
 
 # Shared tolerance for normalized event mass and complete result mass.
 _MASS_TOLERANCE = 1e-12
+# Relative float32 roundoff allowed when a backend's full-vocabulary normalizer
+# is compared with the requested logits.
+_NORMALIZER_TOLERANCE = 1e-5
+
+
+@dataclass(frozen=True)
+class TokenScores:
+    """A model's scores for some next tokens, as a backend reports them.
+
+    ``logits`` holds the requested tokens' raw logits. ``log_normalizer`` is the
+    log of the sum of exp(logit) over the model's **whole** vocabulary at that
+    position. Credences never use it; it only turns the requested logits into
+    unrestricted probabilities for the coverage diagnostic.
+
+    Attributes:
+        logits: Raw logits keyed by token ID, one for every requested token.
+        log_normalizer: Logsumexp of all the model's logits at this position.
+
+    Examples:
+        Two requested tokens, in a vocabulary whose other tokens add up to
+        exp(2.0) of unnormalized weight:
+
+        >>> scores = TokenScores(
+        ...     logits={10: 2.0, 20: 1.0},
+        ...     log_normalizer=logsumexp([2.0, 1.0, 2.0]),
+        ... )
+        >>> round(coverage([10, 20], scores), 6)
+        0.577681
+    """
+
+    logits: Mapping[int, float]
+    log_normalizer: float
+
+
+@dataclass(frozen=True)
+class ScoredPath:
+    """One scored way of writing a candidate, with its probability.
+
+    A candidate is scored in two spellings: as written (``"bare"``) and after
+    one space (``"spaced"``). Each spelling becomes a sequence of token IDs.
+    When both spellings produce the same tokens, one path stands for both.
+
+    Attributes:
+        spellings: ``("bare",)``, ``("spaced",)``, or ``("bare", "spaced")``.
+        token_ids: The path's tokens, counted from where scoring starts.
+        logprob: The path's natural-log probability. A candidate's paths add
+            up to its credence.
+
+    Examples:
+        >>> path = ScoredPath(("spaced",), (17384,), math.log(0.6))
+        >>> round(math.exp(path.logprob), 3)
+        0.6
+    """
+
+    spellings: tuple[str, ...]
+    token_ids: tuple[int, ...]
+    logprob: float
 
 
 @dataclass(frozen=True)
@@ -39,38 +98,55 @@ class RawReadout:
     """The exact numbers behind a Measurement, for auditing and storage.
 
     Most code only needs ``Measurement.credences``. Use this record when you
-    need an answer's precise log credence, or want to know which token IDs
-    were scored for each answer.
+    need an answer's precise log credence, want to see how much each spelling
+    contributed, or want the coverage diagnostic.
 
     Log credences matter for very unlikely answers. A credence such as
     e^-1000 rounds to 0.0 as an ordinary float, but its log credence stays
     -1000.0. Only an answer with exactly zero probability has a log credence
     of ``-inf``.
 
+    ``coverage`` is the model's unrestricted probability that its first answer
+    token begins one of the allowed spellings. It describes the model's habits,
+    not the measurement's accuracy: a model that likes to open with "The" can
+    have low coverage and exactly the same credences as one that answers
+    directly. Credences never depend on it.
+
     Attributes:
         credence_logprobs: Each candidate's credence as a natural-log probability.
-        scored_token_ids: The token IDs scored for each candidate, either the
-            version written as-is or the version with a leading space. Prompt
-            tokens are not included.
-        context_token_count: Number of prompt tokens before the answer.
+        scored_paths: Each candidate's scored paths, bare spelling first. Their
+            probabilities add up to the candidate's credence.
+        context_token_count: Number of prompt tokens before scoring starts.
+        coverage: Unrestricted probability, between 0 and 1, that the model's
+            first answer token begins an allowed spelling.
 
     Examples:
-        Suppose a tokenizer encodes ``"very positive"`` as ``"very"`` (ID 10)
-        followed by ``" positive"`` (ID 11), and ``"negative"`` as one token
-        (ID 20). These IDs are made up for illustration.
+        Suppose ``"yes"`` is token 10 and ``" yes"`` token 11, and ``"no"`` and
+        ``" no"`` are tokens 20 and 21. These IDs are made up for illustration.
 
         >>> raw = RawReadout(
-        ...     credence_logprobs={"very positive": math.log(0.75), "negative": math.log(0.25)},
-        ...     scored_token_ids={"very positive": (10, 11), "negative": (20,)},
+        ...     credence_logprobs={"yes": math.log(0.75), "no": math.log(0.25)},
+        ...     scored_paths={
+        ...         "yes": (
+        ...             ScoredPath(("bare",), (10,), math.log(0.70)),
+        ...             ScoredPath(("spaced",), (11,), math.log(0.05)),
+        ...         ),
+        ...         "no": (
+        ...             ScoredPath(("bare",), (20,), math.log(0.24)),
+        ...             ScoredPath(("spaced",), (21,), math.log(0.01)),
+        ...         ),
+        ...     },
         ...     context_token_count=7,
+        ...     coverage=0.9,
         ... )
-        >>> raw.scored_token_ids["very positive"]
-        (10, 11)
+        >>> [path.token_ids for path in raw.scored_paths["yes"]]
+        [(10,), (11,)]
     """
 
     credence_logprobs: dict[str, float]
-    scored_token_ids: dict[str, tuple[int, ...]]
+    scored_paths: dict[str, tuple[ScoredPath, ...]]
     context_token_count: int
+    coverage: float
 
 
 @dataclass(frozen=True)
@@ -118,10 +194,11 @@ class Measurement:
         """Convert the measurement to a dictionary you can save as JSON.
 
         The dictionary uses the same field names, with ``raw`` as a nested
-        dictionary, and tuples become lists. JSON has no infinity, so a log
-        credence of ``-inf`` (exactly zero probability) becomes ``None``.
-        Finite log credences stay numbers, even when the ordinary credence
-        has rounded to 0.0. Values are not rounded.
+        dictionary; each scored path becomes a dictionary, and tuples become
+        lists. JSON has no infinity, so a log probability of ``-inf`` (exactly
+        zero probability) becomes ``None``. Finite log probabilities stay
+        numbers, even when the ordinary probability has rounded to 0.0. Values
+        are not rounded.
 
         The result is a new copy; editing it does not change the measurement.
 
@@ -129,26 +206,32 @@ class Measurement:
             A dictionary that ``json.dumps(..., allow_nan=False)`` accepts.
 
         Raises:
-            ValueError: A credence or summary is NaN or infinite, or a log
-                credence is NaN or +inf. This happens only with a hand-built
-                Measurement, not one from measurement_from_raw.
+            ValueError: A credence, summary, or coverage is NaN or infinite, or
+                a log probability is NaN or +inf. This happens only with a
+                hand-built Measurement, not one from measurement_from_raw.
 
         Examples:
             A tiny but nonzero credence keeps its log value; an exactly zero
             credence becomes ``None``.
 
             >>> import json
+            >>> def one_path(token, logprob):
+            ...     return (ScoredPath(("bare",), (token,), logprob),)
             >>> raw = RawReadout(
-            ...     {"A": 0.0, "tiny": -1000.0, "zero": -math.inf},
-            ...     {"A": (1,), "tiny": (2,), "zero": (3,)},
-            ...     7,
+            ...     credence_logprobs={"A": 0.0, "tiny": -1000.0, "zero": -math.inf},
+            ...     scored_paths={
+            ...         "A": one_path(1, 0.0),
+            ...         "tiny": one_path(2, -1000.0),
+            ...         "zero": one_path(3, -math.inf),
+            ...     },
+            ...     context_token_count=7,
+            ...     coverage=0.5,
             ... )
-            >>> result = measurement_from_raw(raw)
-            >>> exported = result.to_dict()
+            >>> exported = measurement_from_raw(raw).to_dict()
             >>> exported["raw"]["credence_logprobs"]
             {'A': 0.0, 'tiny': -1000.0, 'zero': None}
-            >>> exported["raw"]["scored_token_ids"]["A"]
-            [1]
+            >>> exported["raw"]["scored_paths"]["zero"]
+            [{'spellings': ['bare'], 'token_ids': [3], 'logprob': None}]
             >>> json.loads(json.dumps(exported, allow_nan=False))["top_labels"]
             ['A']
         """
@@ -163,13 +246,22 @@ class Measurement:
             "margin_confidence": _finite(self.margin_confidence, "margin_confidence"),
             "raw": {
                 "credence_logprobs": {
-                    label: None if value == -math.inf else _finite(value, "credence_logprobs")
+                    label: _json_log(value, "credence_logprobs")
                     for label, value in self.raw.credence_logprobs.items()
                 },
-                "scored_token_ids": {
-                    label: list(path) for label, path in self.raw.scored_token_ids.items()
+                "scored_paths": {
+                    label: [
+                        {
+                            "spellings": list(path.spellings),
+                            "token_ids": list(path.token_ids),
+                            "logprob": _json_log(path.logprob, "scored_paths"),
+                        }
+                        for path in paths
+                    ]
+                    for label, paths in self.raw.scored_paths.items()
                 },
                 "context_token_count": self.raw.context_token_count,
+                "coverage": _finite(self.raw.coverage, "coverage"),
             },
         }
 
@@ -345,37 +437,47 @@ def logprob_sum(values: Iterable[float]) -> float:
 
 
 def measurement_from_raw(raw: RawReadout) -> Measurement:
-    """Build a Measurement from each candidate's log credence.
+    """Build a Measurement from scored paths and log credences.
 
-    Use this when you have one natural-log probability per candidate, for
-    example from TriePlan.score. It computes the credences, the winners, the
-    entropy, and the three confidence summaries.
+    Usually ``raw`` comes from TriePlan.score. This computes the credences, the
+    winners, the entropy, and the three confidence summaries.
 
-    The credences must already sum to 1, within a relative tolerance of
-    1e-12. They are not rescaled for you: a total that is off means
-    something upstream went wrong, and rescaling would hide it.
+    The input must be consistent: each candidate's log credence must equal the
+    combined probability of its scored paths, and the credences must sum to 1,
+    both within a relative tolerance of 1e-12. Nothing is rescaled for you: a
+    total that is off means something upstream went wrong, and rescaling would
+    hide it.
 
     Candidate order follows ``raw.credence_logprobs``. The measurement keeps
     its own copies of the input, so later changes to ``raw`` do not affect it.
 
     Args:
-        raw: Log credences and scored token IDs for at least two candidates,
-            with the same candidates in both mappings.
+        raw: Log credences and scored paths for at least two candidates, with
+            the same candidates in both mappings.
 
     Returns:
         The measurement.
 
     Raises:
-        TypeError: A log credence is not a real number.
-        ValueError: There are fewer than two candidates, the two mappings name
-            different candidates, a log credence is positive, NaN, or +inf,
-            or the credences do not sum to 1.
+        TypeError: A log probability or the coverage is not a real number.
+        ValueError: There are fewer than two candidates; the two mappings name
+            different candidates; a candidate has no scored path; a log
+            probability is positive, NaN, or +inf; a candidate's paths do not
+            add up to its credence; the credences do not sum to 1; coverage is
+            outside 0 to 1; or the prompt token count is negative.
 
     Examples:
+        >>> def one_path(token, probability):
+        ...     return (ScoredPath(("bare",), (token,), math.log(probability)),)
         >>> raw = RawReadout(
-        ...     {"A": math.log(0.6), "B": math.log(0.2), "C": math.log(0.2)},
-        ...     {"A": (10,), "B": (20,), "C": (30,)},
-        ...     7,
+        ...     credence_logprobs={"A": math.log(0.6), "B": math.log(0.2), "C": math.log(0.2)},
+        ...     scored_paths={
+        ...         "A": one_path(10, 0.6),
+        ...         "B": one_path(20, 0.2),
+        ...         "C": one_path(30, 0.2),
+        ...     },
+        ...     context_token_count=7,
+        ...     coverage=0.8,
         ... )
         >>> result = measurement_from_raw(raw)
         >>> result.top_labels
@@ -389,7 +491,7 @@ def measurement_from_raw(raw: RawReadout) -> Measurement:
     """
     if len(raw.credence_logprobs) < 2:
         raise ValueError("A measurement requires at least two candidates")
-    if raw.credence_logprobs.keys() != raw.scored_token_ids.keys():
+    if raw.credence_logprobs.keys() != raw.scored_paths.keys():
         raise ValueError("Log credences and scored paths must have the same candidates")
     logs = {
         label: _log_weight(value, f"log credence for {label!r}")
@@ -397,10 +499,28 @@ def measurement_from_raw(raw: RawReadout) -> Measurement:
     }
     if any(value > 0 for value in logs.values()):
         raise ValueError("A log credence cannot be positive")
+    paths = {label: _scored_paths(label, raw.scored_paths[label]) for label in logs}
+    for label, value in logs.items():
+        combined = logprob_sum(path.logprob for path in paths[label])
+        if combined != value and not math.isclose(
+            combined, value, rel_tol=_MASS_TOLERANCE, abs_tol=_MASS_TOLERANCE
+        ):
+            raise ValueError(
+                f"Scored paths for {label!r} add up to log probability {combined!r}, "
+                f"not its log credence {value!r}"
+            )
     credences = {label: math.exp(value) for label, value in logs.items()}
     total = math.fsum(credences.values())
     if not math.isclose(total, 1.0, rel_tol=_MASS_TOLERANCE, abs_tol=0.0):
         raise ValueError(f"Credences must sum to 1; got {total!r}")
+    coverage = _log_weight(raw.coverage, "coverage")
+    if not 0.0 <= coverage <= 1.0:
+        raise ValueError(f"Coverage must be between 0 and 1; got {coverage!r}")
+    count_value = raw.context_token_count
+    if isinstance(count_value, bool) or not isinstance(count_value, int) or count_value < 0:
+        raise ValueError(
+            f"The prompt token count must be a nonnegative integer; got {count_value!r}"
+        )
     maximum = max(logs.values())
     winners = tuple(label for label, value in logs.items() if value == maximum)
     entropy = -math.fsum(
@@ -412,8 +532,9 @@ def measurement_from_raw(raw: RawReadout) -> Measurement:
     # Own the mappings so changes to the input cannot invalidate these summaries.
     snapshot = RawReadout(
         credence_logprobs=logs,
-        scored_token_ids={label: tuple(raw.scored_token_ids[label]) for label in logs},
-        context_token_count=raw.context_token_count,
+        scored_paths=paths,
+        context_token_count=count_value,
+        coverage=coverage,
     )
     return Measurement(
         credences=credences,
@@ -424,6 +545,69 @@ def measurement_from_raw(raw: RawReadout) -> Measurement:
         margin_confidence=largest - second,
         raw=snapshot,
     )
+
+
+def coverage(allowed: Iterable[int], scores: TokenScores) -> float:
+    """Return the model's unrestricted probability of starting an allowed answer.
+
+    This adds up the full-vocabulary probabilities of the ``allowed`` tokens at
+    one position. It is a diagnostic about the model's habits, not about the
+    accuracy of credences: a model that usually opens with "The" has low
+    coverage, yet its credences can be exactly as good.
+
+    Args:
+        allowed: Token IDs that can begin an allowed answer.
+        scores: The model's logits for those tokens and its full-vocabulary
+            log normalizer at that position.
+
+    Returns:
+        A probability between 0 and 1.
+
+    Raises:
+        BackendReadoutError: A requested logit is missing or invalid, or the
+            log normalizer is not finite or is smaller than the requested
+            tokens' own combined weight.
+
+    Examples:
+        Allowed tokens with probabilities 0.07 and 0.02, when the model would
+        rather write something else:
+
+        >>> scores = TokenScores({1: math.log(0.07), 2: math.log(0.02)}, log_normalizer=0.0)
+        >>> round(coverage([1, 2], scores), 6)
+        0.09
+    """
+    logits = validate_readout(allowed, scores.logits)
+    allowed_mass = logsumexp(logits.values())
+    normalizer = _log_normalizer(scores.log_normalizer, allowed_mass)
+    if allowed_mass == -math.inf:
+        return 0.0
+    return min(1.0, math.exp(allowed_mass - normalizer))
+
+
+def validate_token_scores(wanted: Iterable[int], scores: TokenScores) -> dict[int, float]:
+    """Check one backend readout: every requested logit and the normalizer.
+
+    Args:
+        wanted: Token IDs that were requested.
+        scores: What the backend returned for them.
+
+    Returns:
+        Each requested token ID, once, with its logit.
+
+    Raises:
+        BackendReadoutError: A requested logit is missing or invalid, or the
+            log normalizer is not finite or is smaller than the requested
+            tokens' own combined weight.
+
+    Examples:
+        >>> validate_token_scores([10], TokenScores({10: 1.5}, log_normalizer=1.0))
+        Traceback (most recent call last):
+            ...
+        credences.errors.BackendReadoutError: The log normalizer 1.0 is smaller than the requested tokens' combined weight 1.5
+    """
+    logits = validate_readout(wanted, scores.logits)
+    _log_normalizer(scores.log_normalizer, logsumexp(logits.values()))
+    return logits
 
 
 class _ChoiceRng(Protocol):
@@ -452,13 +636,14 @@ def choose_top_label(measurement: Measurement, *, rng: _ChoiceRng) -> str:
 
     Examples:
         >>> import random
+        >>> from credences.trie import CandidatePaths, build_trie
+        >>> plan = build_trie({"A": CandidatePaths((1,), (2,)), "B": CandidatePaths((3,), (4,))})
+        >>> logits = {1: 0.0, 2: -math.inf, 3: 0.0, 4: -math.inf}
         >>> tied = measurement_from_raw(
-        ...     RawReadout(
-        ...         {"A": -math.log(2), "B": -math.log(2)},
-        ...         {"A": (10,), "B": (20,)},
-        ...         7,
-        ...     )
+        ...     plan.score({(): TokenScores(logits, 1.0)}, context_token_count=7)
         ... )
+        >>> tied.top_labels
+        ('A', 'B')
         >>> choose_top_label(tied, rng=random.Random(7)) in tied.top_labels
         True
     """
@@ -488,14 +673,12 @@ def top_label_weights(measurement: Measurement) -> dict[str, float]:
         ValueError: The measurement has no top labels.
 
     Examples:
-        >>> result = measurement_from_raw(
-        ...     RawReadout(
-        ...         {"A": math.log(0.4), "B": math.log(0.4), "C": math.log(0.2)},
-        ...         {"A": (10,), "B": (20,), "C": (30,)},
-        ...         7,
-        ...     )
-        ... )
-        >>> top_label_weights(result)
+        >>> from credences.trie import CandidatePaths, build_trie
+        >>> forms = {label: CandidatePaths((i,), (i + 10,)) for i, label in enumerate("ABC")}
+        >>> logits = {0: math.log(0.4), 1: math.log(0.4), 2: math.log(0.2)}
+        >>> logits |= dict.fromkeys((10, 11, 12), -math.inf)
+        >>> raw = build_trie(forms).score({(): TokenScores(logits, 0.0)}, context_token_count=7)
+        >>> top_label_weights(measurement_from_raw(raw))
         {'A': 0.5, 'B': 0.5}
     """
     if not measurement.top_labels:
@@ -531,6 +714,42 @@ def _log_weight(value: float, field: str) -> float:
 
 def _bounded_confidence(value: float) -> float:
     return min(1.0, max(0.0, value))
+
+
+def _scored_paths(label: str, paths: Sequence[ScoredPath]) -> tuple[ScoredPath, ...]:
+    """Return validated, immutable copies of one candidate's scored paths."""
+    if not paths:
+        raise ValueError(f"Candidate {label!r} has no scored path")
+    copies = []
+    for path in paths:
+        logprob = _log_weight(path.logprob, f"path log probability for {label!r}")
+        if logprob > 0:
+            raise ValueError(f"A path log probability for {label!r} cannot be positive")
+        copies.append(ScoredPath(tuple(path.spellings), tuple(path.token_ids), logprob))
+    return tuple(copies)
+
+
+def _log_normalizer(value: float, requested_mass: float) -> float:
+    """Validate a full-vocabulary log normalizer against the requested tokens' mass."""
+    try:
+        normalizer = _log_weight(value, "log normalizer")
+    except (TypeError, ValueError) as error:
+        raise BackendReadoutError(str(error)) from error
+    if normalizer == -math.inf:
+        raise BackendReadoutError("The log normalizer must be finite; got -inf")
+    # Backends compute the normalizer in float32, so allow its roundoff.
+    slack = _NORMALIZER_TOLERANCE * max(1.0, abs(normalizer))
+    if requested_mass > normalizer + slack:
+        raise BackendReadoutError(
+            f"The log normalizer {normalizer!r} is smaller than the requested tokens' "
+            f"combined weight {requested_mass!r}"
+        )
+    return max(normalizer, requested_mass)
+
+
+def _json_log(value: float, field: str) -> float | None:
+    """Return a log probability for JSON, with exact zero probability as None."""
+    return None if value == -math.inf else _finite(value, field)
 
 
 def _finite(value: float, field: str) -> float:

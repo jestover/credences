@@ -8,16 +8,10 @@ file, so a fake that drifts from the real interfaces fails type checking.
 import math
 from collections.abc import Mapping, Sequence
 
-from credences.backends import FullLogitsBackend
+from credences.backends import FullLogitsBackend, TokenScores
+from credences.probabilities import RawReadout, logsumexp
 from credences.tokenization import Tokenizer
-from credences.trie import (
-    CandidatePaths,
-    TokenPath,
-    build_trie,
-    first_token_ids,
-    select_paths,
-    validate_potential_paths,
-)
+from credences.trie import CandidatePaths, TriePlan, build_trie
 
 SPECIAL_PIECES = ("<|bos|>", "<|system|>", "<|user|>", "<|assistant|>", "<|end|>")
 
@@ -94,9 +88,10 @@ class DeclaredLogitsBackend:
     """Return declared logits at declared token contexts, and record every call.
 
     ``tables`` maps a complete input (prompt plus answer tokens) to logits for
-    that next position. Requested tokens without a declared logit get
-    ``fill``. Asking about an undeclared context raises LookupError, because
-    it means the test reached a state it did not plan for.
+    that next position. Every vocabulary token without a declared logit gets
+    ``fill``, both when requested and in the full-vocabulary normalizer.
+    Asking about an undeclared context raises LookupError, because it means the
+    test reached a state it did not plan for.
 
     ``top_k`` imitates a faulty backend that returns only its highest-scoring
     requested tokens instead of all of them.
@@ -119,19 +114,19 @@ class DeclaredLogitsBackend:
     def tokenizer(self) -> VocabularyTokenizer:
         return self._tokenizer
 
-    def next_token_logits(
-        self, token_ids: Sequence[int], wanted: Sequence[int]
-    ) -> dict[int, float]:
+    def next_token_logits(self, token_ids: Sequence[int], wanted: Sequence[int]) -> TokenScores:
         context = tuple(token_ids)
         self.calls.append((context, tuple(wanted)))
         if context not in self.tables:
             raise LookupError(f"No logits declared after {context}")
         table = self.tables[context]
+        vocabulary = range(len(self._tokenizer.pieces))
+        log_normalizer = logsumexp(table.get(token, self.fill) for token in vocabulary)
         scores = {token: table.get(token, self.fill) for token in wanted}
         if self.top_k is not None:
             kept = sorted(scores, key=scores.__getitem__, reverse=True)[: self.top_k]
             scores = {token: scores[token] for token in kept}
-        return scores
+        return TokenScores(logits=scores, log_normalizer=log_normalizer)
 
 
 def score_with_backend(
@@ -140,21 +135,18 @@ def score_with_backend(
     forms: Mapping[str, CandidatePaths],
     *,
     end_tokens: Sequence[int] = (),
-) -> tuple[dict[str, TokenPath], dict[str, float]]:
+) -> tuple[TriePlan, RawReadout]:
     """Run the scoring steps against a backend, as a measurement will.
 
-    Returns each candidate's chosen token path and its natural-log credence.
+    ``context`` holds the prompt tokens up to where scoring starts. Returns the
+    plan and the scored result.
     """
-    validate_potential_paths(forms, end_tokens=end_tokens)
-    first = backend.next_token_logits(context, first_token_ids(forms))
-    selected = select_paths(forms, first)
-    plan = build_trie(selected, end_tokens=end_tokens)
-    readouts = {(): first}
-    for request in plan.additional_readouts:
-        readouts[request.prefix] = backend.next_token_logits(
-            (*context, *request.prefix), request.wanted
-        )
-    return selected, plan.score(readouts)
+    plan = build_trie(forms, end_tokens=end_tokens)
+    scores = {
+        request.prefix: backend.next_token_logits((*context, *request.prefix), request.wanted)
+        for request in plan.readouts
+    }
+    return plan, plan.score(scores, context_token_count=len(context))
 
 
 def _conforms(

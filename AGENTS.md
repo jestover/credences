@@ -61,8 +61,8 @@ approximate silently.
 - The answer boundary (SPEC §8) and reasoning inserts (SPEC §9.1) are the two
   easiest places to silently corrupt every number. Touch them only with Tier-2
   tokenizer tests in hand.
-- `Measurement.raw.scored_paths` records every scored path with its text, tokens,
-  and probability; the paths sum to the credence. Preview shows the same paths
+- `Measurement.raw.scored_paths` records every scored path with its spellings,
+  tokens, and probability; the paths sum to the credence. Preview shows the same paths
   and the readout plan. Do not silently change what these fields claim to expose.
 - Every requested backend score must be returned. Missing scores are contract
   errors, not zeros. Do not add a restricted top-K backend to the core.

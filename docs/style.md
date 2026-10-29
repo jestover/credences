@@ -67,21 +67,22 @@ and entropy in bits.
 A representative function docstring has this structure:
 
 ```python
-"""Choose one complete answer representation per candidate.
+"""Return the model's unrestricted probability of starting an allowed answer.
 
-Compare the two forms' first-token logits after the same fixed context.
-Exact ties prefer the bare form.
+This adds up the full-vocabulary probabilities of the allowed tokens at one
+position. It describes the model's habits, not the accuracy of credences.
 
 Args:
-    forms: The bare and additional-space paths for each candidate.
-    first_scores: Raw logits for every distinct first token in those paths.
+    allowed: Token IDs that can begin an allowed answer.
+    scores: The model's logits for those tokens and its full-vocabulary
+        log normalizer at that position.
 
 Returns:
-    Each candidate's selected complete token path, preserving candidate order.
+    A probability between 0 and 1.
 
 Raises:
-    BackendReadoutError: A requested first-token score is missing or invalid.
-    ValueError: Candidate labels or path ownership are invalid.
+    BackendReadoutError: A requested logit is missing or invalid, or the log
+        normalizer is not finite or is smaller than the requested tokens' weight.
 """
 ```
 

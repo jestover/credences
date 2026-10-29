@@ -480,7 +480,7 @@ An end-vs-continue decision is needed when a path of one candidate is a strict
 prefix of a path of a **different** candidate. Within one candidate, one
 spelling's path cannot be a prefix of the other's (the texts `c` and `" " + c`
 never prefix each other once `c` is trimmed); if a tokenizer quirk produced one,
-raise `TokenBoundaryError` (§8.2).
+raise before scoring (§7.1, §8.2).
 
 Resolution order: explicit `end_tokens=` override on `build_credoscope` ->
 blessed-model registry (§9.2) -> for unlisted models, `{tokenizer.eos_token_id}`
@@ -574,8 +574,6 @@ the all-`-inf` fallback, and sums each candidate's paths.
 class ScoredPath:
     spellings: tuple[str, ...]             # ("bare",), ("spaced",), or both when the two
                                            # spellings share one token path
-    text: str                              # answer text from the scoring position, as decoded;
-                                           # includes any merged prompt text (§8.2)
     token_ids: tuple[int, ...]             # the path's tokens after the scoring position
     logprob: float                         # natural-log probability of this path (§5.1)
 

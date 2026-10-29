@@ -1,8 +1,9 @@
 """The interface every model backend implements."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import Protocol
 
+from ..probabilities import TokenScores
 from ..tokenization import Tokenizer
 
 
@@ -32,9 +33,7 @@ class FullLogitsBackend(Protocol):
         """
         ...
 
-    def next_token_logits(
-        self, token_ids: Sequence[int], wanted: Sequence[int]
-    ) -> Mapping[int, float]:
+    def next_token_logits(self, token_ids: Sequence[int], wanted: Sequence[int]) -> TokenScores:
         """Return the model's logits for the requested next tokens.
 
         Args:
@@ -43,7 +42,8 @@ class FullLogitsBackend(Protocol):
             wanted: The token IDs to score at the next position.
 
         Returns:
-            A logit for every ID in ``wanted``, as Python floats. Extra IDs
-            are allowed and ignored.
+            A logit for every ID in ``wanted``, as Python floats (extra IDs are
+            allowed and ignored), and the logsumexp of the logits over the
+            whole vocabulary, used only for the coverage diagnostic.
         """
         ...
