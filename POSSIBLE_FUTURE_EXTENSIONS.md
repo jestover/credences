@@ -378,7 +378,7 @@ one-dimensional numerical inversion. For the core package, plain
 whether option order and code assignment affect measured credences.
 
 This should be a standalone helper, not part of the Credoscope. The Credoscope
-continues to know its candidate strings and two-form continuation policy, not
+continues to know its candidate strings and two-spelling policy, not
 their semantic meanings. A renderer could return a record such as:
 
 ```python
@@ -420,7 +420,7 @@ Credoscope is reused for each candidate set. It may eventually belong in
 better home if prompt design becomes domain-specific.
 
 This task-level renderer is distinct from the core native chat rendering and
-two-form continuation policy in SPEC §4.3 and §8. It can supply an assistant
+two-spelling policy in SPEC §4.3 and §8. It can supply an assistant
 prefill through `messages=`, but semantic mappings and presentation experiments
 remain outside the Credoscope.
 
@@ -463,7 +463,7 @@ Useful implementation constraints to preserve for later:
   handling of failed/truncated traces, and keep calls independent. Researchers
   own trace storage and experiment metadata; no core provenance class is implied.
 
-Validate the core two-form continuation and fixed-context implementation before designing
+Validate the core two-spelling and in-context encoding implementation before designing
 this extension. It should reuse that contract at the post-reasoning answer
 position. Add result fields only for information the extension actually needs;
 v1 has no redundant per-measurement reasoning-mode field.
@@ -526,7 +526,7 @@ benchmarks.
 These are proposed Credoscope experiments, not conclusions established by Jeeves:
 
 - Compare bypass with one completed trace on the same inputs, candidates, and
-  selected-form constrained readout policy. Save full vectors in the research
+  constrained readout policy. Save full vectors in the research
   harness. Measure accuracy separately from entropy, maximum credence, saturation
   rates (for example, above 0.99 and 0.999), confident errors, Brier score, negative
   log likelihood, and calibration. Concentration is not itself a defect when
@@ -585,23 +585,25 @@ implement the ordinary full-logits backend contract, regardless of its location.
 single-ASCII-space variants, such as leading newlines, `"Positive"`, or synonyms;
 or want to include alternative tokenizations of the same surface string.
 
-V1 already compiles `candidate` and `" " + candidate`, with one canonical
-continuation encoding per form under one fixed context. First-token scores select
-one complete path per candidate before constrained scoring. It does not enumerate
-paths such as `["p", "os", "itive"]` or add newline prefixes unless they are
-literal parts of a declared candidate. Broader forms change the allowed output
-language, not merely parsing. Their excluded probability need not be negligible.
+V1 already scores `candidate` and `" " + candidate`, each in its canonical
+tokenization encoded together with the prompt, in one union trie, and sums them
+per candidate. It does not enumerate paths such as `["p", "os", "itive"]` or add
+newline prefixes unless they are literal parts of a declared candidate. Broader
+forms change the allowed output language, not merely parsing. Their excluded
+probability need not be negligible.
 
-Any broader extension must specify whether it still selects one form or instead
-sums probabilities over all admitted forms. Those are different measurement
-definitions; summing would require one union trie and log-space aggregation by
-candidate, not averaging independently normalized distributions. Retain disjoint
-path ownership, shared-prefix accounting, fixed context, and explicit stopping
-rules. Update raw-path reporting and preview semantics to match the chosen policy.
+The natural extension lets callers list accepted spellings per candidate, such
+as `"Yes"` and `"yes"`, each scored in both v1 spellings and summed in the same
+union trie with log-space aggregation by candidate, not by averaging
+independently normalized distributions. Retain disjoint path ownership,
+shared-prefix accounting, the shared scoring position, and explicit stopping
+rules. Non-canonical tokenizations stay out: Geh et al. (EMNLP 2024) find they
+usually carry little probability, and their benchmark gains required a tuned
+mixing weight.
 
 A grammar/vocabulary compiler could enumerate alternatives without users listing
-them, but summing all paths may require many more model evaluations than selecting
-one representation. Bound whitespace alternatives and establish a concrete
+them, but summing many paths may require many more model evaluations than the
+two v1 spellings. Bound whitespace alternatives and establish a concrete
 research benefit before expanding the core contract. Vocabulary tokens may combine
 whitespace with text or represent whitespace alone; a first-piece regex search
 does not capture every whole-label canonical encoding.

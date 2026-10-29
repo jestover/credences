@@ -22,24 +22,29 @@ shape. A Credoscope measures candidate answers supplied by the caller. → SPEC 
 
 `.preview()` is a no-inference inspection helper, not another measurement mode.
 It shares preparation with `.measure()` and returns a readable report of the
-actual context and candidate continuations. Users can inspect role delimiters,
-duplicate cues, whitespace, and both possible token paths without inference or
-prompt metadata on every result. It cannot identify selected paths without the
-model's first-token scores. The package does not guess which wording to remove.
-→ SPEC §4.4.
+actual prompt, every scored token path, and the readout plan. Users can inspect
+role delimiters, duplicate cues, whitespace, and where scoring starts without
+inference or prompt metadata on every result. Because no step depends on the
+model's scores, preview shows exactly what measurement will use. The package does
+not guess which wording to remove. → SPEC §4.4.
 
-## D3. Bind exact candidate strings once
+## D3. Bind candidate strings once, trimmed at the ends
 
-`build_credoscope` binds a model to a `Sequence[str]` of exact answer strings.
-The candidates may be semantic words such as `"positive"` or codes such as `"A"`,
+`build_credoscope` binds a model to a `Sequence[str]` of answer strings. The
+candidates may be semantic words such as `"positive"` or codes such as `"A"`,
 but the Credoscope does not distinguish those cases. It has no descriptions,
-semantic-label mapping, or presentation metadata. At least two unique, non-empty
-candidates are required. Each has two canonical continuation forms: the exact
-candidate and one additional ASCII space followed by it. Internal spelling and
-whitespace stay fixed; no other forms or segmentations are added. First-token
-scores select one complete form per candidate, with bare preferred on exact ties.
-Result keys remain the original strings. Reject overlapping accepted surface
-sets or token paths across labels. → SPEC §4.1, §4.3, §8.
+semantic-label mapping, or presentation metadata. At least two candidates are
+required.
+
+Leading and trailing whitespace is trimmed before scoring; internal whitespace is
+kept. End whitespace is about where an answer sits, which the two spellings
+already measure (D14): a candidate written `" yes"` would double the spaced
+spelling's space and remove the unspaced option. Internal whitespace is part of
+what the answer says, so collapsing it would silently change the scored text and
+could merge distinct candidates. Most users never think about this, so the rule
+is stated plainly in the documentation. Result keys remain the original strings
+so lookups keep working; candidates that are empty or duplicated after trimming
+are rejected. → SPEC §4.1, §4.3, §8.
 
 ## D4. Accept one input or a sequence
 
@@ -49,15 +54,27 @@ order. The scalar form keeps interactive use direct; the sequence form provides 
 stable surface for future backend batching without a second measurement verb. → SPEC
 §4.2, §6.3.
 
-## D5. The measurand is the forced-choice distribution
+## D5. The measurand is the forced-choice distribution over both spellings
 
-First-token scores choose one representation per candidate; constrained scoring
-then uses only those selected paths. Shared prefixes receive one weight before
-later branches divide it. Do not sum the forms or normalize per-label maxima
-before merging shared first tokens. This is the distribution of a decoder using
-the same selection, stopping, and transition rules, not every structured-output
-engine or global conditioning on complete valid answers. Selection plus trie
-scoring must match an independent two-stage reference. → SPEC §5, §7, §14.
+A candidate's credence is the probability that a decoder, allowed to write only
+the candidates' spellings, writes that candidate with or without the leading
+space. All paths share one trie; shared prefixes receive one weight before later
+branches divide it, and each candidate sums its paths. This is the distribution
+of a decoder using the same masking, stopping, and transition rules, not every
+structured-output engine or global conditioning on complete valid answers. Trie
+scoring must match an independent reference that enumerates and sums every path.
+→ SPEC §5, §7, §14.
+
+Summing replaced an earlier rule that kept only the spelling with the higher
+first-token score. The case for choosing was real: the model almost always
+prefers one spelling, so summing rarely moves a credence much (at most 0.0014 in
+SPEC §5.2's example), and choosing looks like a cleaner decision. Summing won
+because the allowed texts are identical under both rules, so it opens no door to
+further variants; it removes a discontinuity, since choosing jumps between two
+continuations when two first-token scores cross; it costs nothing for one-token
+candidates and only extra branch readouts where candidates share a first word
+under the weaker spelling; and "with or without a space" is easier to explain
+than "whichever first token scored higher, bare on ties".
 
 Singleton transitions are forced with probability 1. At an all-`-inf` branch,
 use uniform probability over distinct allowed token ids; when any score is finite,
@@ -87,7 +104,9 @@ assistant content in their declared roles. → SPEC §4.2, §8.
 using an accessible, matching tokenizer. V1 implements MLX. Future cluster or
 researcher-controlled server runtimes may implement the same contract; physical
 locality is not the requirement. Requested logits are enough for masked scoring,
-so the protocol need not return a full-vocabulary probability array. → SPEC §10.
+so the protocol need not return a full-vocabulary probability array. Each readout
+also returns one number, the full-vocabulary log normalizer, used only for the
+coverage diagnostic (D16). → SPEC §10.
 
 ## D8. Restricted probability APIs are outside the core
 
@@ -144,33 +163,48 @@ the researcher decides how to record model versions, prompts,
 code, and run metadata. Independent measurement calls are an execution contract,
 not a promise of bitwise reproducibility across environments. → SPEC §5.5, §6.
 
-## D14. Two starting forms at a fixed context
+## D14. Two spellings, scored in context
 
-Bare and leading-space forms can have different relative label probabilities.
-Use the model's first-token logits at each prompt to choose a form per candidate,
-then retain its entire path. This avoids scoring both later subtrees, while making
-the representation policy explicit. It is not summation across spellings or
-maximum complete-answer likelihood; discarded forms need not be noise or have
-negligible mass. Restricting each surface to canonical continuation encoding
-bounds work without enumerating every possible segmentation.
+Each candidate is scored as written and after one space. Most tokenizers fold
+the space between words into the following word's token, and whether a model
+writes it depends on what precedes the answer: chat headers ending in a newline
+suggest the bare spelling, while `"Answer:"` or Mistral's `[/INST]` suggest the
+spaced one. Scoring both avoids guessing per model. Anything else in front of the
+answer (a newline, an extra space, markdown) is the model choosing to format its
+reply, like starting with "The", and stays excluded. Capitalization and synonyms
+change the word, so they remain the caller's choice of candidates.
 
-Only the start of the whole candidate varies. Tokenize `c` and `" " + c` in full;
-do not assume their tokenizations differ only in the first token, and do not
-toggle whitespace at internal token boundaries. Extra newlines, tabs, case
-variants, synonyms, and all-tokenization marginalization are outside v1.
+Each spelling uses one canonical tokenization. Geh et al. (EMNLP 2024) show that
+the most likely tokenization and the sum over all tokenizations are NP-hard and
+#P-hard to compute, that the canonical tokenization usually holds nearly all of
+a text's probability (about 99.6% for `Tokens` under Llama 2), and that gains from
+non-canonical tokenizations needed a mixing weight tuned on held-out data. A
+measurement should not depend on such tuning, so non-canonical tokenizations of
+a spelling are not added.
 
-Render the native assistant opening, bypass, and optional caller prefill first,
-then freeze every context token. Preserve a prefill's trailing whitespace; the
-spaced form adds one more space even when one is already present. Canonical
-continuation encoding must respect that boundary rather than re-tokenizing the
-whole concatenated text and absorbing a prompt token. Tokenizer-specific
-start-of-string preprocessing requires tested suffix behavior, not guesswork.
+Spellings are encoded together with the prompt text, and scoring starts at the
+longest token prefix shared by the prompt and every spelling. Tests on nine
+tokenizer families showed why: SentencePiece tokenizers (Mistral, Phi) give an
+answer encoded on its own a dummy space, so the bare spelling silently became
+the spaced token; a prompt ending in a space leaves a lone space token that
+byte-level tokenizers would have merged into the answer word; and newlines can
+re-split before a word. Moving the start of scoring to the shared prefix gives
+the model the tokens it would see for the full text, without changing any of
+the user's text. lm-evaluation-harness does a narrower version of this (moving a
+context's trailing whitespace into the continuation); computing the shared prefix
+also catches non-whitespace merges and verifies the split. An exact round trip
+of every encoding is required, so a tokenizer that alters text fails loudly.
 
-The scoring trie is compiled after the first-token readout, and may be reused only
-for identical selected paths and `END`. Selection runs again for every measurement.
-Preview shows the fixed context and both alternatives, not a selected plan.
-Small score changes near a form tie can change later branches; deterministic does
-not mean insensitive to numerical variation. → SPEC §4.3, §4.4, §8.
+Prefills are kept exactly, including trailing whitespace, because they are text
+the user chose to have the model "already write". Some templates (Llama 3, Gemma,
+Mistral) trim them, and `transformers` follows suit silently, so credences
+restores the trimmed whitespace and raises on any other change. A trailing space
+then needs no special handling: it merges into the answer tokens. Prefills stay
+allowed because they often move a chat model straight to its answer.
+
+The scored paths and readout plan depend only on the prompt and candidates, not
+on scores, so plans may be reused for identical paths and `END`, and preview can
+show the plan. → SPEC §4.3, §4.4, §8.
 
 ## D15. uv-managed library project
 
@@ -180,3 +214,15 @@ committed lockfile, commands, and builds. Keep the planned Hatchling build backe
 developer tools use a `dev` dependency group and runtime integrations use optional
 extras. This is project tooling, not a requirement that downstream users run uv.
 → SPEC §12, §15; PLAN Phase 0.
+
+## D16. Coverage is a diagnostic, not a quality score
+
+`raw.coverage` reports the model's unrestricted probability that its first
+answer token begins an allowed spelling. It does not enter credences, and the
+library never filters, reweights, or warns on it, because low coverage is not
+evidence of worse credences. A model that habitually opens with "The"
+(`"The"` 0.90, `"yes"` 0.07, `"no"` 0.02) and one that answers directly
+(`"yes"` 0.70, `"no"` 0.20, `"The"` 0.01) produce the same credences, yes 0.78 and
+no 0.22, at coverage 0.09 and 0.90. Which is more accurate is an empirical,
+model-dependent question that coverage lets researchers study. It is a small raw
+field, not a headline feature. → SPEC §6.5, §10.2.

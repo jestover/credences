@@ -5,6 +5,10 @@ model. They show the lower-level building blocks that the planned model-backed
 API will run for you; that API is not implemented yet. Run the snippets on this
 page in order.
 
+The measurement design now adds the probabilities of both spellings of each
+answer. The building blocks shown here still choose one spelling, and this page
+will be updated when they change.
+
 `>>>` and `...` mark interactive Python input; unprefixed lines are expected
 output. To turn a snippet into a script, remove the prompts and output lines.
 

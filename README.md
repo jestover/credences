@@ -24,7 +24,9 @@ Early development. The package is not yet on PyPI.
   computes each answer's probability, confidence summaries, and JSON output.
   The interfaces a model backend and its tokenizer will implement
   (`credences.backends.FullLogitsBackend`, `credences.tokenization.Tokenizer`)
-  and the chat message types (`credences.types`) are defined too.
+  and the chat message types (`credences.types`) are defined too. The scoring
+  code still keeps one spelling per answer; it is being updated to add both
+  spellings, as described in [How answers are scored](#how-answers-are-scored).
 - **Not yet available:** tokenizing answers, loading a model, and a one-call
   measurement API. The planned API looks like this:
 
@@ -43,14 +45,20 @@ Early development. The package is not yet on PyPI.
 A model writes one token at a time, and an answer such as `"very positive"`
 may be several tokens. To get one probability per answer:
 
-1. **Encode each answer twice:** as written, and with a space in front.
-   Tokenizers often split `"positive"` and `" positive"` into different tokens,
-   and a model may expect either right after the prompt. For each answer,
-   `credences` keeps whichever version's first token the model scores higher.
-2. **Score only the allowed tokens.** At each step, the model's scores for the
+1. **Two spellings of each answer.** Each answer is scored as written and
+   with one space in front, because whether a model writes that space depends
+   on what comes before the answer. An answer's probability is the total of
+   both. Spaces around your answers are trimmed (`" yes "` is scored as
+   `"yes"`); spaces inside them are kept.
+2. **Encoded with your prompt.** Each spelling is turned into tokens together
+   with the prompt, the way the model would see the full text. Your prompt and
+   any prefill are used exactly as written. If their last characters merge with
+   the answer, such as a trailing space in `"Answer: "`, that text is scored as
+   the start of the answer so the model sees its usual tokens.
+3. **Score only the allowed tokens.** At each step, the model's scores for the
    tokens the answers allow there are turned into probabilities among those
    tokens alone, ignoring the rest of the vocabulary.
-3. **Multiply along each answer.** An answer's probability is the product of
+4. **Multiply along each answer.** A spelling's probability is the product of
    its steps. Answers that start with the same token share that step's
    probability instead of each counting it in full. When one answer is the
    start of another (`"up"` and `"upward"`), the model's choice to stop is read
@@ -58,7 +66,9 @@ may be several tokens. To get one probability per answer:
 
 The resulting probabilities sum to 1 over your answers. They describe how the
 model divides its belief among the answers you gave, for that prompt; they are
-not guaranteed to be calibrated.
+not guaranteed to be calibrated. Other ways of writing an answer, such as a
+capitalized `"Yes"` or a newline before it, are not counted, so write your
+answers the way your prompt asks for them.
 
 ## Try it
 

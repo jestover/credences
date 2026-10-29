@@ -4,9 +4,11 @@
 >
 > **Reading order:** read this file §1–§8 first. Then `DECISIONS.md`
 > for *why* the design is shaped this way, then `AGENTS.md` for the working rules.
-> **Review focus:** tokenize the candidate and one ASCII-space-prefixed form
-> (§4.3, §8), select one by its first-token score, then score the selected trie. The caller
-> owns optional assistant prefills through `messages=`; context tokens stay fixed.
+> **Review focus:** each candidate is scored in two spellings, as written and
+> after one space, and its credence is their combined probability (§4.3, §5.1).
+> Both spellings are encoded together with the prompt text and scored from the
+> tokens they share with it (§8). The caller owns optional assistant prefills
+> through `messages=`; prompt and prefill text are never changed.
 > V1 requires arbitrary-token logit access and implements MLX only (§10).
 > Model-specific rendering and tokenization must pass the §14 tests before a
 > model is supported. Remaining implementation questions are listed in §16.
@@ -48,12 +50,11 @@ m.margin_confidence       # 0.85 — top label's lead over the runner-up (§6.1)
 ```
 
 The numbers are illustrative, not benchmark results. The model's native template
-opens the answer position; the library adds no answer cue. For each candidate,
-the two possible continuation texts are the candidate itself and one ASCII space
-followed by that candidate. For each candidate, select the complete path whose
-first token has the higher logit at the fixed context; exact ties select the bare
-form. Build and score a trie containing only the selected paths (§5, §8).
-Result keys remain the declared candidates.
+opens the answer position; the library adds no answer cue. Each candidate has two
+spellings: the candidate itself and one ASCII space followed by it. Whether a
+model writes that space depends on what precedes the answer, so both are scored
+and a candidate's credence is the total probability of its two spellings (§4.3,
+§5). Result keys remain the declared candidates.
 
 The library implements the **generic measurement machinery only**. No earnings-call /
 transcript / portfolio / event-study logic lives here — that belongs in the analysis
@@ -70,7 +71,9 @@ codebase that consumes `credences`.
 | **margin confidence** | the top credence minus the second-highest credence; decisiveness against the nearest competitor (§6.1) | relates to CDS 2026 in the binary case |
 | **inner confidence** | the CDS binary measure `|p − 1/2|`; a literature reference point, not the primitive API concept | CDS 2026 (NBER w34965) |
 | **declared confidence** | the model's *self-reported* confidence number — biased; a contrast, not what we measure | CDS 2026 |
-| **candidate** | an exact answer value (`"positive"` or `"A"`); first-token scores select its bare or single-space-prefixed path, and it remains the result key | — |
+| **candidate** | an answer value (`"positive"` or `"A"`), trimmed of surrounding whitespace for scoring; it remains the result key as supplied | — |
+| **spelling** | one of a candidate's two scored texts: the candidate as written (*bare*) or after one space (*spaced*) | — |
+| **coverage** | a diagnostic: the model's unrestricted probability that its first answer token begins one of the allowed spellings (§6.5); not a measure of accuracy | — |
 | **label geometry** | researcher-supplied structure on labels — e.g. sentiment scores `(-1, 0, 1)` — used for application-specific projections, not part of the generic credence measurand | — |
 
 We use "credence" rather than "confidence" because "confidence" is overloaded (CDS
@@ -87,13 +90,12 @@ distribution.
   (credences + summaries + audit trail).
 - Multi-token candidates via a token trie with exactly-specified probability
   semantics (§5, §7).
-- Two canonical continuation forms per candidate: bare and prefixed with one
-  ASCII space. First-token scores select one complete path per candidate before
-  constrained scoring (§4.3, §5, §8).
+- Two spellings per candidate, bare and prefixed with one ASCII space, each in
+  its canonical tokenization; a candidate's credence sums both (§4.3, §5, §8).
 - Native assistant opening by default; optional caller-owned assistant prefill
   through `messages=` (§4.2). No package-supplied answer cue or template option.
-- A no-inference `.preview()` of the actual compiled context and candidate
-  possible continuations, for checking formatting before measurement (§4.4).
+- A no-inference `.preview()` of the actual compiled context, every scored token
+  path, and the readout plan, for checking formatting before measurement (§4.4).
 - **Reasoning bypass** for chain-of-thought models (§9). Generated reasoning and
   comparisons between reasoning modes are deferred.
 - One hardened backend: **MLX** (Apple Silicon), with arbitrary-token logit
@@ -109,10 +111,10 @@ distribution.
 - ❌ Task-prompt construction, option-order randomization, code assignment, or semantic
   remapping. These belong to the caller; a possible helper is described in
   `POSSIBLE_FUTURE_EXTENSIONS.md`. Task wording, assistant prefills, and semantic
-  mappings remain caller-owned; the library defines the two-form policy (§4.3).
+  mappings remain caller-owned; the library defines the two-spelling policy (§4.3).
 - ❌ Restricted top-K probability APIs, partial readouts, or imputed token scores.
 - ❌ Whitespace variants beyond the one optional initial ASCII space, case or
-  synonym expansion, enumeration of alternative tokenizations, or mandatory JSON.
+  synonym expansion, non-canonical tokenizations of a spelling, or mandatory JSON.
 - ❌ Extracting probabilities from *inside* a chain-of-thought.
 - ❌ Distributed scheduling, checkpoint/resume, `save_dir` plumbing.
 - ❌ DataFrames as a hard dependency (optional adapter only, §12).
@@ -143,8 +145,8 @@ ms = scope.measure(prompt=["...", "..."])  # sequence -> list[Measurement], 1:1,
 ```
 
 Options after `candidates` are keyword-only. Construction validates configuration;
-each measurement prepares both context-dependent paths, queries first-token
-scores to select one per candidate, and then scores the selected trie (§8).
+each measurement encodes both spellings of every candidate together with the
+prompt text, then scores all of them in one trie (§8).
 
 There is deliberately **no `temperature` parameter**. Extraction reads the model's
 next-token distribution; extraction does not sample, and rescaling logits by a
@@ -160,22 +162,30 @@ no `__call__` — `.measure()` is the one measurement entry point; `.preview()` 
 its inspection-only companion (§4.4). `Credoscope` is exported for type
 annotations; `build_credoscope` is the blessed constructor.
 
-### 4.1 `candidates` — exact answer strings (bound at build)
+### 4.1 `candidates` — answer strings (bound at build)
 
 `candidates` is a `Sequence[str]`, for example
 `["positive", "negative", "neutral"]` or `["A", "B", "C"]`. Each string is
-an exact answer value and the corresponding key in `Measurement.credences`.
-Each candidate has two continuation texts: `candidate` and `" " + candidate`
-(§4.3). The Credoscope has no separate knowledge of semantic labels,
-descriptions, codes, or option presentation in the task prompt.
+an answer value and, exactly as supplied, the corresponding key in
+`Measurement.credences`. Each candidate is scored in two spellings: the
+candidate and `" " + candidate` (§4.3). The Credoscope has no separate knowledge
+of semantic labels, descriptions, codes, or option presentation in the task prompt.
 
-Candidates must be unique, non-empty strings. Sequence order is the canonical
+**Trimming.** Leading and trailing whitespace (as removed by Python's
+`str.strip()`) is removed from each candidate before scoring; internal whitespace
+is kept exactly. Whether an answer begins with a space is the model's choice,
+which the two spellings already measure: a candidate written as `" yes"` would
+turn the spaced spelling into a double space and leave no unspaced option.
+Trailing whitespace would make the model write a space before stopping. Internal
+whitespace, as in `"very positive"`, is part of what the answer says, so it is
+not collapsed. The documentation states this rule; the result keys stay as the
+caller wrote them so lookups keep working.
+
+After trimming, candidates must be non-empty and unique; `["yes", " yes"]` is
+rejected because both would score the same text. Sequence order is the canonical
 candidate order used to present results, including all tied winners (§6.4),
 without selecting one winner. A bare string and all mapping types are rejected;
 candidate descriptions and semantic metadata are not accepted here.
-Candidate text is literal, including any internal whitespace. If the accepted
-forms of two candidates overlap, reject the set as ambiguous; for example,
-`["positive", " positive"]` would assign the same response to two result keys.
 `K = len(candidates)` must be at least 2. A one-option forced choice always returns
 credence 1.0 and therefore contains no information; `build_credoscope` rejects it.
 
@@ -220,10 +230,14 @@ print(scope.preview(messages=messages))
 m = scope.measure(messages=messages)
 ```
 
-The prefill is supplied text, not generated reasoning. Preserve its content,
-including trailing whitespace. Place it at the final answer position after the
-model-specific reasoning bypass. If a profile cannot render that combination
-faithfully, raise before scoring; do not relocate, trim, or silently drop it (§8).
+The prefill is supplied text, not generated reasoning. Keep it exactly as
+written, including trailing spaces and newlines, at the final answer position
+after the model-specific reasoning bypass. Some chat templates (Llama 3, Gemma,
+Mistral) trim message content, and `transformers` then drops the prefill's
+trailing whitespace without warning; credences puts that whitespace back after
+rendering (§8.1). If a template changes the prefill in any other way, raise
+before scoring rather than relocate, rewrite, or drop it. A trailing space needs
+no special care from the caller: it merges into the answer tokens (§8.2).
 
 `messages=` requires a chat template; on a template-less base model it raises
 `ValueError` naming the model. Only `reasoning="bypass"` is supported in v1;
@@ -237,28 +251,61 @@ and join it to the returned candidate credences. A future standalone rendering
 helper is described in `POSSIBLE_FUTURE_EXTENSIONS.md`.
 
 Raw completion mode: on a template-less base model, `prompt=` is the complete
-fixed context text, with no chat template, added cue, or implicit newline. The
-caller includes any desired prefill in that string. The same two continuation
-forms and fixed-token-boundary rules apply. On a chat model, use `messages=` for
-an assistant prefill rather than embedding chat markers in `prompt=`.
+prompt text, with no chat template, added cue, or implicit newline. The caller
+includes any desired prefill in that string. The same two spellings and
+in-context encoding rules apply (§8.2). On a chat model, use `messages=` for an
+assistant prefill rather than embedding chat markers in `prompt=`.
 
-### 4.3 Two canonical starting forms and selection
+### 4.3 Two spellings per candidate
 
-For each candidate `c`, v1 prepares exactly these two possible surface forms:
+For each (trimmed) candidate `c`, v1 scores exactly two spellings:
 
 ```text
 bare:   c
 spaced: " " + c
 ```
 
-The added character is one ASCII space (`U+0020`), not arbitrary whitespace. It
-occurs only before the entire candidate. Do not add tabs, newlines, capitalization
-variants, synonyms, or independently optional spaces at internal token boundaries.
-There is no formatting argument, placeholder syntax, or automatic answer cue.
-Prefills belong to the input (§4.2).
+A candidate's credence is the **total** probability of its two spellings (§5.1).
 
-Tokenize each complete surface once using the profile's canonical continuation
-encoder at the same fixed context (§8). Illustrative splits include:
+**Why both.** In written text one space separates words, and most tokenizers
+fold that space into the following word's token (`" yes"` is a single token,
+different from `"yes"`). Whether the model writes the space depends on what
+precedes the answer, and differs between models:
+
+| Text before the answer | Spelling the model's chat format suggests (inferred from templates, not measured) |
+|---|---|
+| Chat header ending in a newline (Qwen, Llama 3, Gemma, gpt-oss) | bare: `"yes"` |
+| Mistral's `[/INST]` (its template puts a space before replies) | spaced: `" yes"` |
+| A prefill such as `"Answer:"` | spaced: `" yes"` |
+
+Rather than guess per model, credences scores both and adds them. When one
+spelling dominates, the total is close to that spelling alone; when the model is
+undecided about the space, both contribute, and the credence changes smoothly
+with the model's scores instead of jumping between spellings. In the five-label
+example of §5.2, adding instead of choosing the stronger spelling moves no
+credence by more than 0.0014.
+
+**Why only these two.** Anything else in front of the answer (a newline, a
+second space, `**`, a quotation mark) is the model choosing to format its reply,
+like starting with "The"; those outputs are not answers in the candidate's form
+and are excluded by the constraint. Capitalization and synonyms change the word
+itself, so they are the caller's choice of candidates, not an automatic
+variant. The added character is one ASCII space (`U+0020`), only before the
+whole candidate, never between its internal tokens. There is no formatting
+argument, placeholder syntax, or automatic answer cue. Prefills belong to the
+input (§4.2).
+
+**One tokenization per spelling.** Each spelling is scored in its canonical
+tokenization: the one the tokenizer produces when the spelling is encoded
+together with the prompt text (§8.2). Other token sequences that spell the same
+text, such as `["y", "e", "s"]`, are not added. Tokenizers never produce them,
+models rarely generate them, and Geh et al. (2024) find that the canonical
+tokenization usually carries almost all of a text's probability. For `Tokens`
+under Llama 2 it carries about 99.6%, with 51 alternatives sharing the rest.
+Their benchmark gains from adding non-canonical tokenizations required tuning a
+mixing weight on held-out data, which a measurement should not depend on.
+
+Illustrative splits, after a context that ends in a newline:
 
 | Candidate | Bare path | Spaced path |
 |---|---|---|
@@ -266,51 +313,17 @@ encoder at the same fixed context (§8). Illustrative splits include:
 | `"very positive"` | `["very", " positive"]` | `[" very", " positive"]` |
 | `"elequent"` | `["ele", "quent"]` | `[" ele", "quent"]` |
 | `"eloquent"` | `["elo", "quent"]` | `[" eloquent"]` |
+| `"1"` | `["1"]` | `[" ", "1"]` (digits do not absorb a space in Llama 3 or Qwen) |
 
 These splits are illustrative, not promises about a vocabulary. The leading
-space can change more than the first token boundary, so encode both whole strings
-rather than replacing the first token id. After choosing a form, its internal
-tokenization is fixed. Do not also enumerate paths such as `["p", "os", "itive"]`
-unless that is itself the canonical encoding of one of the two surfaces.
+space can change more than the first token, so each spelling is encoded whole
+rather than by swapping its first token id. Some tokenizers give both spellings
+the same token path in a given context (Phi-3.5 after its assistant header);
+such a path is scored and counted once.
 
-At measurement time, query the logits of all distinct first-token ids at `C` in
-one readout. Independently for each candidate, select the form whose first token
-has the higher score. Comparing logits gives the same selection as comparing
-full-vocabulary probabilities at that context. For an exact tie, including two
-`-inf` scores, choose the bare form. This deterministic spelling tie-break is
-separate from reporting all tied final labels (§6.4).
-
-Retain the selected form's **entire** token sequence. Build the scoring trie from
-these selected paths, merging shared prefixes. A shared first token enters the
-root normalizer once, not once per candidate. Do not sum or average the forms,
-multiply in a probability of choosing a form, or choose the maximum complete-path
-probability. The selection criterion is only the first-token score (§5.1).
-
-Vocabulary searches for whitespace variants of the bare first piece are not
-sufficient: if `"eloquent"` is `["elo", "quent"]` but `" eloquent"` is one token,
-matching only `"elo"` and `" elo"` misses the latter. Tokenize whole forms instead.
-Other whitespace tokens can exist, including standalone indentation/newline tokens
-and tokens combining a tab with text. Their existence does not expand the two-form
-policy: no search over `\s*`, tab/newline prefixes, or multiple added spaces in v1.
-
-The first-token model readout receives only the unchanged context `C`, including
-any prefill ending in `"Answer:"` or `"Answer: "`. It does not receive either
-candidate form appended to the prompt. The prepared paths identify which
-next-token logits to inspect in that one readout. If `"positive"` and
-`" positive"` are each one token, compare those two logits and retain the
-higher-scoring token for the label `"positive"`. If either form spans multiple
-tokens, compare their first-token logits and retain the selected complete path.
-Then compute credences by constrained scoring of the selected trie, as above.
-
-Prefill whitespace remains part of `C`; it is not removed or deduplicated against
-a candidate's leading space. Thus the spaced form adds one space even when the
-prefill already ends in a space. Native template or prefill newlines likewise
-remain in the context, not among generated answer alternatives.
-
-The policy is a bounded, model-selected measurement constraint, not a claim to
-capture every way the model could emit a label, maximize whole-answer likelihood,
-or eliminate prompt sensitivity. Use `.preview()` to inspect the fixed context
-and both possible paths; the selected path is known only after a score readout.
+The policy is a bounded measurement constraint, not a claim to capture every
+way the model could express a label or to eliminate prompt sensitivity. Use
+`.preview()` to inspect the context and the exact paths that will be scored.
 
 ### 4.4 Preview the actual model input
 
@@ -330,33 +343,31 @@ for report in scope.preview(prompt=["First passage...", "Second passage..."]):
 
 Each report includes:
 
-- The full decoded fixed context `C`, without truncation or hidden special tokens.
+- The full rendered prompt text, without truncation or hidden special tokens.
   This includes actual role delimiters, bypass text if present, and any supplied
   assistant prefill. Show both readable text and an escaped representation so
   trailing spaces and newlines can be inspected.
-- Every candidate in declared order, with both surfaces labeled `bare` and
-  `spaced`, their escaped text, and their complete token-id paths. Derive each
-  continuation text from `decode(C + T)` after the verified `decode(C)` boundary,
-  not from isolated token decoding (§8.2). Context plus continuation reconstructs
-  each complete candidate-filled text. Explain that first-token scores select one
-  complete path per candidate during measurement; do not mark either as selected.
-- The resolved `END` token ids when a possible end-vs-continue decision needs
-  them (§5.3), without claiming that the selected trie will contain that branch.
+- Where scoring starts: the scoring position `R` (§8.2). When the prompt's last
+  characters merge into the answer tokens, such as a trailing space, show that
+  text and say it is scored as the start of each answer.
+- Every candidate in declared order, with its trimmed text and both spellings
+  labeled `bare` and `spaced`: their escaped text and complete token-id paths
+  from `R`. Mark a path shared by both spellings.
+- The resolved `END` token ids when an end-vs-continue decision exists (§5.3).
+- The readout plan: the scoring position and every later prefix at which scores
+  will be requested, with the token ids requested there (§7.2).
 
-Label context and continuations separately. Candidates are supplied alternatives,
+Label prompt and answers separately. Candidates are supplied alternatives,
 not generated answers or predictions. The report is for inspection, not a second
 prompt to feed back into `.measure()` or a machine-readable serialization format.
-Later branch readouts use `C` plus a candidate-path prefix (§7); the complete
-candidate-filled texts are not all independently submitted for generation.
 
 **One preparation path:** preview and measurement must share input validation,
-native rendering, fixed-context continuation encoding, and potential-path/`END`
-validation. There is no simplified preview renderer. For identical input and
-scope, preview describes exactly the `C` and alternatives measurement will
-consider. It cannot know the selected paths, actual branch plan, logits, or
-credences without inference. Invalid inputs or boundaries raise the same
-preparation errors; no partial batch report is returned. Backend/score errors
-can occur only during measurement.
+native rendering, in-context encoding, path and `END` validation, and plan
+construction. There is no simplified preview renderer. Because the scored paths
+do not depend on the model's scores, preview shows exactly the prompt, paths, and
+readouts a measurement will use; only the logits and credences need inference.
+Invalid inputs or boundaries raise the same preparation errors; no partial batch
+report is returned. Backend/score errors can occur only during measurement.
 Preview does not query logits, generate text, allocate model/KV state for a call,
 or change subsequent measurements. It uses the already-built scope's tokenizer
 and configuration; this does not imply a separate model-loading API.
@@ -370,124 +381,115 @@ prompt metadata to every `Measurement`.
 
 This section is normative. Every number the library returns is defined here.
 
-### 5.1 The measurand: selected-form constrained distribution
+### 5.1 The measurand: constrained distribution over both spellings
 
-The procedure has two stages: **deterministically select one representation per
-candidate using first-token scores**, then measure the forced-choice distribution
-over the selected token paths. It is not the distribution of a decoder admitting
-both forms at once. It does not sum their mass, average their distributions, or
-maximize complete-answer probabilities.
+The credence of a candidate is the probability that a decoder, allowed to write
+only the candidates' spellings, writes one of that candidate's spellings.
 
-Let `B(c)` and `W(c)` be the canonical paths for candidate `c` and `" " + c`,
-both extending the same fixed context `C` (§8). Query the raw model score `z(t)`
-at `C` for every distinct first token in those paths. Select:
+Let `S(c)` be the distinct token paths of candidate `c`'s two spellings (one path
+when both spellings tokenize identically), all continuing from the shared
+scoring position `R` (§8.2). Build one trie containing every path of every
+candidate. At prefix `P`, the allowed set `A(P)` contains the distinct next
+tokens of paths through `P`, plus the model's `END` tokens when a path of one
+candidate ends at `P` and a path of another candidate continues (§5.3). At a
+leaf, stop without an additional model query.
 
-    T(c) = W(c)  if z(W(c)[0]) > z(B(c)[0])
-           B(c)  otherwise
-
-Thus ties, including two negative infinities, select the bare form. Reuse these
-scores for the root of the selected trie; selection is not another random event
-and contributes no probability factor. The resulting trie can depend on the
-prompt's scores even when all possible token paths are unchanged.
-
-Build one trie containing exactly `T(c)` for each candidate. At prefix `P`,
-the allowed set `A(P)` contains the distinct next tokens of selected paths,
-plus the model's `END` tokens when a selected path ends there and another
-continues (§5.3). At a leaf, stop without an additional model query.
-
-For a nonempty allowed set of size `n = |A(P)|`, define the transition rule:
+For a nonempty allowed set of size `n = |A(P)|`, with raw model scores `z_P`,
+define the transition rule:
 
     p_tilde(t | P) = 1                              if n = 1
                     1/n                            if all allowed scores are -inf
                     exp(z_P(t) - logsumexp(z_P(A))) otherwise
 
-A singleton is forced, regardless of its unqueried model score. At a branching
-node with at least one finite score, individual `-inf` scores get probability
-zero and the finite scores divide the total mass. NaN, positive infinity, and
-missing requested scores are errors, not inputs to the uniform fallback (§10.2).
+A singleton is forced, regardless of its model score. At a branching node with
+at least one finite score, individual `-inf` scores get probability zero and the
+finite scores divide the total mass. NaN, positive infinity, and missing
+requested scores are errors, not inputs to the uniform fallback (§10.2).
 
 The all-`-inf` case is an explicit uniform **token-level fallback**, not an
 inference that the model has equal beliefs over labels. A nested trie need not
 yield uniform final label credences when its branch transitions are uniform.
 Never replace small finite scores with this fallback.
 
-A candidate's credence is the product along its one selected path:
+A path's probability is the product along it, and a candidate's credence is the
+sum over its paths:
 
-    credence(c) = product of p_tilde(next token | prefix) along T(c)
-                  * p_tilde(END | T(c)) if a longer selected path continues there
+    pi(T)        = product of p_tilde(next token | prefix) along T
+                   * p_tilde(END | T)   if another candidate's path continues there
+    credence(c)  = sum of pi(T) for T in S(c)
 
 Here `p_tilde(END | P)` is the sum of transition probabilities for the distinct
 tokens in `END`. A shared edge contributes once to its node's normalizer, even
-when many candidates use it. Credences sum to 1 by construction, with no
-label-level renormalization.
+when several paths or candidates use it. Every path belongs to exactly one
+candidate, so credences sum to 1 by construction, with no label-level
+renormalization.
 
-**Interpretation:** a decoder with this same first-token selection, selected-path
-mask, forced transitions, and uniform fallback would sample this distribution.
-It is not a promise of parity with arbitrary structured-output engines or of
-prompt-independent, calibrated belief. Discarded forms can have real probability;
-max selection is a specified representation policy, not a noise-removal theorem.
+**Interpretation:** a decoder restricted to these paths, with the same forced
+transitions and uniform fallback, would sample this distribution, and the
+credence of `c` is how often it writes `c` with or without the leading space. It
+is not a promise of parity with arbitrary structured-output engines or of
+prompt-independent, calibrated belief.
 
 **Why this is not global conditioning:** computing each complete answer's joint
 unconstrained probability and renormalizing at the end is a different target.
-Local masks redistribute mass at each decision, forced steps contribute 1, and
-the selected output language itself depends on the initial scores. See
-*Grammar-Aligned Decoding* (References) for the distinction between local masking
-and conditioning. Full joint probabilities would also require full-vocabulary
-normalizers at every step, which requested raw logits alone do not provide.
+Local masks redistribute mass at each decision and forced steps contribute 1.
+See *Grammar-Aligned Decoding* (References) for the distinction between local
+masking and conditioning. Full joint probabilities would also require
+full-vocabulary normalizers at every step.
 
-### 5.2 Worked example (five candidates, selected forms)
+### 5.2 Worked example (five candidates)
 
 Candidates `["very negative", "negative", "neutral", "positive", "very positive"]`.
-Assume these illustrative root probabilities:
+Assume these illustrative probabilities at the scoring position:
 
-| Starting piece | Bare-token probability | Spaced-token probability | Selected token |
-|---|---|---|---|
-| very | 0.10 | 0.001 | `"very"` |
-| negative | 0.65 | 0.002 | `"negative"` |
-| neutral | 0.20 | 0.001 | `"neutral"` |
-| positive | 0.02 | 0.001 | `"positive"` |
+| Starting piece | Bare-token probability | Spaced-token probability |
+|---|---|---|
+| very | 0.10 | 0.001 |
+| negative | 0.65 | 0.002 |
+| neutral | 0.20 | 0.001 |
+| positive | 0.02 | 0.001 |
 
-Both `"very ..."` candidates select the path starting with `"very"`. The root
-normalizer is `0.10 + 0.65 + 0.20 + 0.02 = 0.97`, with `"very"` counted once.
-At the selected `"very"` prefix, let `p(" negative") = 0.95` and
-`p(" positive") = 0.01`, giving local denominator 0.96.
+All eight distinct first tokens are allowed, so the root normalizer is
+`0.10 + 0.001 + 0.65 + 0.002 + 0.20 + 0.001 + 0.02 + 0.001 = 0.975`, with `"very"`
+counted once although two candidates start with it. After `"very"`, let
+`p(" negative") = 0.95` and `p(" positive") = 0.01` (local denominator 0.96).
+After `" very"`, let `p(" negative") = 0.90` and `p(" positive") = 0.05` (0.95).
 
 ```text
-credence(negative)      = 0.65/0.97                 = 0.6701
-credence(neutral)       = 0.20/0.97                 = 0.2062
-credence(positive)      = 0.02/0.97                 = 0.0206
-credence(very negative) = (0.10/0.97) * (0.95/0.96) = 0.1020
-credence(very positive) = (0.10/0.97) * (0.01/0.96) = 0.0011
-                                               sum = 1.0000
+credence(negative)      = (0.65 + 0.002)/0.975                        = 0.6687
+credence(neutral)       = (0.20 + 0.001)/0.975                        = 0.2062
+credence(positive)      = (0.02 + 0.001)/0.975                        = 0.0215
+credence(very negative) = (0.10/0.975)(0.95/0.96) + (0.001/0.975)(0.90/0.95) = 0.1025
+credence(very positive) = (0.10/0.975)(0.01/0.96) + (0.001/0.975)(0.05/0.95) = 0.0011
+                                                                 sum = 1.0000
 ```
 
-There are two readouts: the initial comparison of all eight distinct first-token
-ids, reused to score the selected root, and the selected `"very"` branch.
-There is no readout after the discarded `" very"` token.
+There are three readouts: the scoring position (all eight first tokens), the
+`"very"` branch, and the `" very"` branch. Choosing only the stronger spelling of
+each candidate would give `0.6701, 0.2062, 0.0206, 0.1020, 0.0011`, differing by
+at most 0.0014, but would jump if two spellings' first-token scores crossed.
 
-*End-vs-continue example.* If selected paths for `"increase"` and
-`"increase substantially"` are `["increase"]` and
-`["increase", " substantially"]`, query `END union {" substantially"}` there.
-If their selected forms instead begin with distinct tokens and neither selected
-path prefixes the other, that end-vs-continue branch is absent.
+*End-vs-continue example.* For `"increase"` and `"increase substantially"`, the
+bare paths `["increase"]` and `["increase", " substantially"]` share a prefix,
+and so do the spaced paths `[" increase"]` and `[" increase", " substantially"]`.
+Both prefixes need `END union {" substantially"}` readouts.
 
 ### 5.3 The end-of-answer set (`END`)
 
-An end-vs-continue decision is needed when a selected path is a strict prefix of
-another candidate's selected path. Alternatives of the same candidate never
-coexist in the scoring trie and do not create such a decision.
+An end-vs-continue decision is needed when a path of one candidate is a strict
+prefix of a path of a **different** candidate. Within one candidate, one
+spelling's path cannot be a prefix of the other's (the texts `c` and `" " + c`
+never prefix each other once `c` is trimmed); if a tokenizer quirk produced one,
+raise `TokenBoundaryError` (§8.2).
 
 Resolution order: explicit `end_tokens=` override on `build_credoscope` ->
 blessed-model registry (§9.2) -> for unlisted models, `{tokenizer.eos_token_id}`
 plus additional special tokens matching a known end-of-turn list, with a warning.
 Resolve and deduplicate `END` at build time.
 
-Preparation conservatively validates every potential prefix overlap between
-forms of different candidates, before model inference. If any such pair lacks
-a usable `END`, or its continuation token is also in `END`, raise `ValueError`.
-Preview performs the same preflight. After selection, only overlaps that remain
-in the selected trie produce readouts. This ensures inference cannot choose an
-unsupported stopping boundary.
+Every path is known before inference (§8.3), so preparation checks every
+end-vs-continue boundary: if a boundary lacks a usable `END`, or its continuation
+token is also in `END`, raise `ValueError`. Preview performs the same check.
 
 Normalize over individual token ids, including all distinct `END` ids, then sum
 the `END` probabilities. If all scores are `-inf`, each allowed token gets
@@ -501,28 +503,31 @@ represent stopping at an end-vs-continue branch.
 
 ### 5.4 Failure modes these definitions exclude
 
-1. **Scoring the unselected union.** Comparing both first tokens does not admit
-   both complete forms into the scoring trie. Discard the losing path first.
-2. **Per-label root normalization.** If two selected paths begin with `"pos"`,
-   that token gets one root weight; divide it at a later branch. Counting it
-   twice or normalizing per-candidate first-token maxima changes the result.
-3. **Replacing only the first token.** A selected `" positive"` token must not
-   inherit `"itive"` from a discarded `["pos", "itive"]` path.
-4. **Mixed probability conventions.** All actual decisions use §5.1's rule,
-   including end-vs-continue nodes. No unnormalized terminal factors or
-   complement terminal mass.
-5. **Zero-score arithmetic.** Do not evaluate `-inf - (-inf)`, replace tiny
+1. **Choosing one spelling.** Keeping only the higher-scoring spelling of each
+   candidate is a different, discontinuous measurand. Score every path.
+2. **Per-label or per-spelling root normalization.** If two paths begin with
+   `"pos"`, that token gets one root weight; divide it at a later branch. Counting
+   it twice, or normalizing each candidate's spellings separately, changes the
+   result.
+3. **Double-counting one path.** When both spellings of a candidate tokenize to
+   the same path, it is one outcome and is counted once.
+4. **Replacing only the first token.** A spaced `" positive"` token must not
+   inherit `"itive"` from the bare `["pos", "itive"]` path; each spelling keeps
+   its own complete tokenization.
+5. **Encoding answers on their own.** A spelling encoded without its prompt can
+   get the wrong tokens (Mistral encodes a lone `"yes"` as `"▁yes"`, its spaced
+   token). Encode in context (§8.2).
+6. **Mixed probability conventions.** All decisions use §5.1's rule, including
+   end-vs-continue nodes. No unnormalized terminal factors or complement mass.
+7. **Zero-score arithmetic.** Do not evaluate `-inf - (-inf)`, replace tiny
    finite scores by zero, or use uniform fallback when any allowed score is finite.
 
-The §14 parity test compares the complete two-stage procedure with an independent
-reference: select each path, derive the selected allowed sets, then apply the
-chain rule including forced transitions and all-`-inf` fallback.
+The §14 parity test compares trie scoring with an independent reference that
+enumerates every path, applies the chain rule including forced transitions and
+the all-`-inf` fallback, and sums each candidate's paths.
 
 ### 5.5 Numerical rules
 
-- Compare raw first-token logits at the same fixed context, not rounded
-  probabilities. Equal computed scores select the bare form, independently of
-  candidate order. Reuse the same readout for selected-root normalization.
 - Compute in **natural-log space**. With at least one finite allowed score,
   step logprob is `score(t) - logsumexp(allowed scores)`. A forced step contributes
   0; an all-`-inf` branching step contributes `-ln(n)` for each of its `n`
@@ -531,12 +536,14 @@ chain rule including forced transitions and all-`-inf` fallback.
   Bound positive grouped-event roundoff at log probability 0 only when excess
   mass is within relative tolerance `1e-12`; larger excess mass raises.
   Preserve negative event logs, including tiny finite values and `-inf`.
-- A candidate's log credence is the sum of step logprobs along its selected path.
-  There is no sum across forms. For `"very negative"` in §5.2:
+- A path's log probability is the sum of step logprobs along it. A candidate's
+  log credence combines its paths with the same grouped-event sum, because its
+  spellings are mutually exclusive outcomes. For `"very negative"` in §5.2:
 
-      log credence = ln(0.10) - ln(0.97) + ln(0.95) - ln(0.96)
+      log credence = logsumexp(ln(0.10) - ln(0.975) + ln(0.95) - ln(0.96),
+                               ln(0.001) - ln(0.975) + ln(0.90) - ln(0.95))
 
-  Exponentiating gives about `0.1020`. Preserve a finite log credence even when
+  Exponentiating gives about `0.1025`. Preserve a finite log credence even when
   exponentiation underflows to `0.0`; exact zero mass has log credence `-inf`.
   Determine winning labels from unrounded log credences (§6.4).
 - The backend casts requested bf16/fp16 logits to **float32** before returning
@@ -549,33 +556,38 @@ chain rule including forced transitions and all-`-inf` fallback.
   logits; quantized weights still measure the loaded quantized model.
 - A fixed absolute probability error can be large relative to a small probability.
   Log-space arithmetic avoids additional underflow; it cannot undo upstream
-  quantization/logit error. Max selection does not guarantee better accuracy or
-  establish that the discarded form was noise.
+  quantization/logit error.
 - Entropy uses `0 * log 0 = 0`.
 - Measurement has no sampling or cross-call semantic state. Bitwise reproducibility
   is not promised across kernels, batching, devices, or environments. Researchers
   own experiment tracking.
-- **Token-granularity caveat:** first-token selection can compare `"pos"` with
-  `" positive"`, even though they consume different amounts of text. A prefix
-  token's score is not the probability of the entire label. A selected standalone
-  space can likewise carry broad continuation mass. This is part of the specified
-  token-level procedure, not semantic equivalence or calibration. Inspect both
-  possible paths with preview and the selected paths in `raw.scored_token_ids`.
-- Selection is discrete: a small first-logit change can switch a whole path and
-  its later branch contexts. Determinism does not imply insensitivity to numerical
-  perturbations near a form-selection tie.
+- **Token-granularity caveat:** the root compares tokens that cover different
+  amounts of text, such as `"pos"` and `" positive"`, and a standalone space token
+  (the spaced spelling of a digit) can carry broad continuation mass. This is
+  part of the specified token-level procedure, not semantic equivalence or
+  calibration. Inspect the paths with preview and in `raw.scored_paths`.
 
 ## 6. Result objects
 
 ```python
 @dataclass(frozen=True)
+class ScoredPath:
+    spellings: tuple[str, ...]             # ("bare",), ("spaced",), or both when the two
+                                           # spellings share one token path
+    text: str                              # answer text from the scoring position, as decoded;
+                                           # includes any merged prompt text (§8.2)
+    token_ids: tuple[int, ...]             # the path's tokens after the scoring position
+    logprob: float                         # natural-log probability of this path (§5.1)
+
+@dataclass(frozen=True)
 class RawReadout:
     credence_logprobs: dict[str, float]    # per candidate: ln(credence) — natural log; the
                                            # log-space source of Measurement.credences
-    scored_token_ids: dict[str, tuple[int, ...]]
-                                           # per candidate: selected complete path;
-                                           # does not list discarded form comparisons
-    context_token_count: int                # length of C actually scored
+    scored_paths: dict[str, tuple[ScoredPath, ...]]
+                                           # per candidate: every scored path, bare first;
+                                           # their probabilities sum to the credence
+    context_token_count: int                # tokens before the scoring position R
+    coverage: float                         # diagnostic, not accuracy (§6.5)
 
 @dataclass(frozen=True)
 class Measurement:
@@ -638,7 +650,8 @@ class Measurement:
 - Experiment metadata, model identifiers, versions, and semantic mappings live
   in caller-owned data, not a per-measurement metadata object. There is no
   `Measurement.reasoning`: bypass is the only supported mode. The raw readout
-  contains measurement-specific log credences and token paths, not run metadata.
+  contains measurement-specific log credences, scored paths, and coverage, not
+  run metadata.
 
 No DataFrames in the core. An optional `credences.frames` adapter (separate import,
 optional `pandas`/`polars` extra) converts `list[Measurement]` to a DataFrame.
@@ -717,103 +730,129 @@ For `top_labels == ("A", "B")`, the weights are `{"A": 0.5, "B": 0.5}`,
 even if the actual credences are `{"A": 0.4, "B": 0.4, "C": 0.2}`. No warning
 is emitted for a tie; it is a valid result exposed directly in the return type.
 
+### 6.5 Coverage: a diagnostic, not a quality score
+
+`raw.coverage` is the model's unrestricted probability, at the scoring position,
+that its next token begins one of the allowed spellings: the full-vocabulary
+softmax summed over the allowed first tokens. It is an upper bound on how likely
+the model was to answer with a candidate unprompted, because a token that begins
+a spelling may continue differently.
+
+Credences do not depend on coverage, and low coverage is **not** evidence of
+worse credences. Consider two models answering a yes/no question:
+
+| Model | Next-token probabilities | Coverage | Credences |
+|---|---|---|---|
+| 1 | `"The"` 0.90, `"yes"` 0.07, `"no"` 0.02 | 0.09 | yes 0.78, no 0.22 |
+| 2 | `"yes"` 0.70, `"no"` 0.20, `"The"` 0.01 | 0.90 | yes 0.78, no 0.22 |
+
+Model 1 habitually opens with "The"; model 2 answers directly. Their credences
+are identical, and either could be the more accurate in a given setting; whether
+coverage relates to accuracy is an empirical, model-dependent question. Coverage
+is reported for inspection and research. The library never filters, reweights,
+or warns on it.
+
+The scoring position is always read, even when only one token is allowed there,
+so coverage is always defined. It needs one extra number from the backend: the
+log normalizer over the whole vocabulary at that position (§10.2).
+
 ## 7. The token trie
 
-The trie is pure and backend-independent: selected token paths in, a readout plan
-out, credences back. A separate pure selector compares supplied first-token scores;
-the Credoscope owns the model calls and invokes selection before trie construction.
+The trie is pure and backend-independent: token paths in, a readout plan out,
+credences back. The Credoscope owns the model calls.
 
 ### 7.1 Inputs and structure
 
-Input: `sequences: dict[str, tuple[int, ...]]`, exactly one selected complete
-path per candidate. All paths extend the same fixed context `C`.
+Input: `paths: dict[str, tuple[tuple[int, ...], ...]]`, the distinct paths of
+each candidate's spellings (one or two per candidate), all continuing from the
+same scoring position `R`.
 
 Each node is a unique prefix `P`, with distinct child token ids and at most one
-candidate owning the terminal. Merge shared prefixes; never duplicate an edge's
-weight because several candidates follow it. A terminal with children is an
-end-vs-continue node, whose allowed set includes `END`.
+candidate owning a path that ends there. Merge shared prefixes; never duplicate
+an edge's weight because several paths follow it. A node where one candidate's
+path ends and another candidate's path continues is an end-vs-continue node,
+whose allowed set includes `END`.
 
 Validation:
 
-- Empty paths and identical paths owned by different candidates raise `ValueError`.
+- Empty paths, and identical paths owned by different candidates, raise
+  `ValueError`. A candidate's own two spellings sharing one path is allowed; it is
+  stored once.
+- A path that is a strict prefix of another path of the same candidate raises
+  (§5.3).
 - At an end-vs-continue node, `END` must be nonempty and disjoint from child ids.
-- Preparation additionally validates both possible forms before selection (§8.2),
-  so a backend readout cannot reveal a previously unvalidated path.
-- A candidate contributes only its selected path. Same-candidate form deduplication
-  and path aggregation are not operations of this scoring trie.
 
 ### 7.2 The readout plan
 
-The Credoscope first queries all distinct first tokens of both forms at `C`,
-then selects the paths and builds the trie. It reuses that readout to normalize
-the root over **selected distinct child ids only**.
+The plan depends only on the paths and `END`, never on scores, so it is built
+before any model call and preview can show it.
 
-For each non-root node `P` with at least two allowed token ids, query
-`next_token_logits(C + P, A(P))`. Skip singleton nodes: their transition is
-defined as forced, with probability 1, even if the unqueried score would be
-`-inf`. Leaves stop without querying an end score.
+- Always read the scoring position `R`, requesting every allowed first token and
+  the full-vocabulary log normalizer used for coverage (§6.5).
+- For each non-root node `P` with at least two allowed token ids, query
+  `next_token_logits(R + P, A(P))`.
+- Skip non-root singleton nodes: their transition is forced, with probability 1,
+  even if the unqueried score would be `-inf`. A singleton root is still read,
+  for coverage only; its transition is still forced. Leaves stop without
+  querying an end score.
 
-Total readouts are one initial selection readout plus the number of non-root
-branch nodes in the selected trie. Even if the selected root has only one child,
-the initial readout can be necessary to choose that child's spelling and hence
-later model contexts. Forced prefixes must still be appended before scoring a
-later branch; skipping a readout does not delete tokens from model history.
-
-With `["very positive", "very negative"]` and shared first-token alternatives
-`"very"` / `" very"`, selection chooses the same form for both candidates.
-Read the two first-token scores once, then score only the selected prefix's
-`" positive"` / `" negative"` branch. If all selected first tokens are distinct,
-there is only the initial readout. Forward-pass cost remains a backend concern;
-readout count alone is not a wall-clock guarantee.
+Forced prefixes must still be appended before scoring a later branch; skipping
+a readout does not delete tokens from model history. With `["very positive",
+"very negative"]`, the plan reads the scoring position, then the `"very"` and
+`" very"` branches. If every first token belongs to one candidate's spelling,
+the scoring position is the only readout. Forward-pass cost remains a backend
+concern; readout count alone is not a wall-clock guarantee.
 
 ### 7.3 Scoring
 
-Given selected paths and validated requested-token logits:
+Given the paths and validated requested-token logits:
 
 ```text
 for each node P whose allowed set A(P) is nonempty:
     if len(A(P)) == 1:
-        step_logprob(P, sole token) = 0       # no score query
+        step_logprob(P, sole token) = 0       # forced
     elif all scores over A(P) are -inf:
         step_logprob(P, each token) = -ln(len(A(P)))
     else:
         logdenom = logsumexp(scores over A(P))
         step_logprob(P, token) = score[P][token] - logdenom
 
-for each candidate c with selected path T(c):
-    log_credence(c) = sum of step logprobs along T(c)
-    if another selected path continues through T(c):
-        log_credence(c) += logsumexp(
-            step_logprob(T(c), e) for e in END
-        )  # bound positive grouped-event roundoff at 0 per §5.5
+for each path T:
+    path_logprob(T) = sum of step logprobs along T
+    if another candidate's path continues through T:
+        path_logprob(T) += logsumexp(step_logprob(T, e) for e in END)
+        # bound positive grouped-event roundoff at 0 per §5.5
+
+for each candidate c:
+    log_credence(c) = logsumexp(path_logprob(T) for T in S(c))
+        # same grouped-event bound
 ```
 
-The normalized transitions and stopping events partition mass among candidates,
-so final credences sum to 1 without another normalization. A selected path with
-a zero-probability edge retains log credence `-inf`; uniform transitions farther
-down that path do not restore its lost incoming mass.
+The normalized transitions and stopping events partition mass among paths, and
+each path belongs to one candidate, so final credences sum to 1 without another
+normalization. A path with a zero-probability edge retains log probability
+`-inf`; uniform transitions farther down that path do not restore its lost
+incoming mass.
 
-**Parity invariant (§14):** selection plus trie scoring must match an independent
-reference using the same deterministic selection rule and naïve chain rule over
-the selected paths. Include shared roots, score-dependent branch appearance,
+**Parity invariant (§14):** trie scoring must match an independent reference
+that enumerates every path, applies the naïve chain rule, and sums each
+candidate's paths. Include shared roots, shared paths of one candidate,
 singleton forcing, mixed finite/`-inf` scores, and uniform fallback. A reference
-that scores both forms or normalizes first-token maxima per label is incorrect.
+that keeps only one spelling per candidate or normalizes per label is incorrect.
 
 ### 7.4 What the trie is not
 
-It is not a guided-generation engine, KV cache, tokenizer, or model client.
-It is also not responsible for deciding which spelling the model prefers:
-selection consumes externally supplied first-token scores before the trie runs.
-Keeping both pure operations separate makes their contracts directly testable.
+It is not a guided-generation engine, KV cache, tokenizer, or model client. It
+does not choose between spellings; it scores all of them.
 
-## 8. Fixed-context continuation tokenization
+## 8. In-context tokenization
 
-V1 compiles exactly two continuation texts per candidate: the candidate itself
-and one additional ASCII space followed by it. First-token scores select one
-complete path at measurement time. Do not enumerate other segmentations or make
-whitespace optional inside a label (§4.3).
+Each spelling is tokenized as part of the full text the model would see, the
+prompt followed by the answer, and scored from the tokens that text shares with
+the prompt. The prompt's text is never changed; only the position where scoring
+starts can move.
 
-### 8.1 Render and freeze the context
+### 8.1 Render the prompt text
 
 For a chat model, render completed messages with the native template. If the
 last input message is from the user, open the assistant's final answer position,
@@ -824,9 +863,13 @@ assistant prefill is equivalent to opening the answer position without a prefill
 
 Use a supported continuation-of-final-message mechanism or an equivalent tested
 model-profile renderer. Do not both open another assistant turn and continue an
-existing one. Preserve all prefill characters, including trailing whitespace;
-template trimming must not silently change the supplied final assistant content.
-Do not run candidate continuations through a chat-template filter that trims them.
+existing one. The rendered text must end with the prefill exactly:
+
+- If the template trimmed the prefill's trailing whitespace (Llama 3, Gemma and
+  Mistral templates apply `| trim`, and `transformers` then strips the rendered
+  text to match), append the removed whitespace.
+- If the template changed the prefill in any other way, including removing
+  leading whitespace, raise `TokenBoundaryError` naming the model.
 
 Native assistant formatting is model-specific. Preserve role/channel delimiters
 and native opening whitespace exactly once. A generation opening need not be
@@ -835,152 +878,145 @@ must validate both the no-prefill and explicit-prefill cases. Do not invent an
 answer cue, move user text into the assistant turn, close the final assistant
 turn, or append a second bypass block.
 
-For a template-less base model, use the caller's `prompt` as the context text.
-Render and encode once, with the profile's special-token policy, to obtain `C`.
-All of `C` is fixed for both forms of every candidate. Neither tokenization nor
-scoring may trim, re-encode, shorten, or otherwise rewrite it. No model call or
-per-call KV state is needed to prepare this context.
+For a template-less base model, the caller's `prompt` is the prompt text. No
+model call or per-call KV state is needed to prepare it.
 
-### 8.2 Canonical continuation encoding
+### 8.2 In-context encoding and the scoring position
 
-The profile provides a deterministic, tokenizer-bound
-`encode_continuation(C, surface)` operation. It applies the tokenizer's canonical
-segmentation to the **complete** surface with the existing token boundary fixed.
-It must not insert BOS/EOS or a dummy start-of-string space absent from that
-surface. Use ordinary string encoding when it meets the suffix contract;
-otherwise use a tested tokenizer-specific configuration. Do not globally mutate
-the tokenizer used to render prompts.
+Tokenizers encode text differently depending on its neighbors. Measured on
+real tokenizers:
 
-Canonical whole-concatenated-text encoding is not the contract. If `C` ends with
-a standalone space token, encoding a bare continuation must not replace that
-context token with a combined space-and-word token. Joint-text prefix subtraction
-is only a valid optimization when it preserves `C` and reproduces the same paths.
+- **Byte-level tokenizers** (Qwen, gpt-oss, Llama 3, SmolLM) attach a space to
+  the following word, so `"Answer: yes"` is `[":", " yes"]`. A prompt ending in
+  `"Answer: "` would leave a lone `" "` token before `"yes"`, a sequence the model
+  almost never saw in training.
+- **SentencePiece tokenizers** add a "dummy" space when encoding text on its own:
+  Mistral encodes a lone `"yes"` as `"▁yes"`, its spaced token, while in context
+  `"Answer:yes"` ends in a different, unspaced token. Phi-3.5 encodes a lone
+  `" yes"` with a stray extra space token.
+- **Newlines** can re-split: SmolLM2 encodes `"Answer:\n\n"` with one `"\n\n"`
+  token but `"Answer:\n\nyes"` with two `"\n"` tokens.
 
-Preparation, shared by preview and measurement:
+So each spelling is encoded together with the prompt, and scoring starts where
+the encodings stop agreeing:
 
 ```text
-C = render_and_encode_context(input, reasoning="bypass")
-for candidate in candidates:
-    forms[candidate] = {}
-    for name, surface in (("bare", candidate), ("spaced", " " + candidate)):
-        T = encode_continuation(C, surface)
-        require T is nonempty
-        require decode(C + T) == decode(C) + surface
-        forms[candidate][name] = T
-validate_potential_paths(forms, END)
+text      = render_prompt_text(input, reasoning="bypass")       # §8.1
+prompt    = encode(text)
+for candidate c, for spelling s in (c, " " + c):
+    full[c, s] = encode(text + s)
+    require decode(full[c, s]) == text + s                     # exact round trip
+require decode(prompt) == text
+R         = longest common prefix of prompt and every full[c, s]
+path[c, s] = full[c, s][len(R):]                               # nonempty
 ```
 
-Decoding retains special tokens and disables whitespace cleanup. Validate
-context-plus-path decoding, not concatenated decodes of isolated tokens.
-If exact surface preservation fails, raise `TokenBoundaryError` naming the
-candidate and form. Do not silently omit a form, change its segmentation to
-pass the check, or rewrite context.
+`R` is the scoring position, shared by every candidate and spelling. Text after
+`R`, such as a prompt's trailing space, becomes the start of every path. The
+model then sees exactly the tokens it would see if the full text `"…Answer: yes"`
+appeared in its input. This is the "prompt boundary" problem that token healing
+addresses (Lundberg & Ribeiro 2023), and it generalizes lm-evaluation-harness,
+which moves a context's trailing whitespace into the continuation and encodes
+the whole string. Computing the shared prefix, rather than moving whitespace by
+rule, also catches merges that are not whitespace and verifies the split instead
+of assuming it.
 
-The two forms can have different first pieces, token counts, and suffixes.
-There is one canonical path per surface, not a search over all tokenizations.
-Encoding these alternatives requires no inference. Selecting between them does.
+A shared position matters when candidates merge differently. With the prompt
+`"…Answer: "` and candidates `"yes"` and `"1"`, Qwen, Llama 3 and gpt-oss merge
+the space into `" yes"` but keep it separate from the digit, so `R` ends after
+`":"` and the paths are `[" yes"]` and `[" ", "1"]`.
 
-Preflight rejects empty paths, cross-candidate surface/path collisions, and
-potential cross-candidate prefix overlaps without a usable, disjoint `END`
-(§5.3). A prefix relationship between a single candidate's own two forms is not
-an end-vs-continue decision, because only one will be selected. Both forms must
-pass exact decoding checks even when a structural representation deduplicates
-identical paths.
+Special tokens: chat templates already write the beginning-of-sequence token
+where the model expects it, so encode rendered chat text with
+`add_special_tokens=False`. Encoding it with the Hugging Face default doubles that
+token on Llama 3, Gemma and Mistral. For a base model's raw prompt, use the
+tokenizer's own start-of-sequence policy, and raise if that policy appends
+special tokens at the end.
 
-### 8.3 Build, selection, and reuse timing
+Decoding retains special tokens and disables whitespace cleanup. If any round
+trip fails, a path is empty, or one candidate's path prefixes its own other path,
+raise `TokenBoundaryError` naming the model and the text. Phi-3.5, whose
+tokenizer changes text next to special tokens, fails this check and is
+unsupported. Do not rewrite the prompt text, drop a spelling, or change a
+segmentation to pass the check.
 
-`build_credoscope` binds model, candidates, bypass policy, and resolved `END`.
-It validates candidate values and overlapping surface forms, without requiring
-a sample prompt or predicting future selected paths.
+Encoding requires no inference. There is one canonical path per spelling, not a
+search over tokenizations.
+
+### 8.3 Build, measure, and reuse
+
+`build_credoscope` binds model, trimmed candidates, bypass policy, and resolved
+`END`. It validates candidate values without requiring a sample prompt.
 
 For each measurement:
 
-1. Render `C` and compile/validate both forms (§8.2).
-2. Request all distinct first-token ids in one backend readout at `C`.
-3. Select one complete path per candidate using §5.1's rule.
-4. Build or reuse a pure trie plan for the **selected** paths and `END`.
-5. Score the selected root from the existing readout, then query its non-root
-   branch nodes. Store the selected paths in `raw.scored_token_ids`.
+1. Render the prompt text and encode every spelling in context (§8.1, §8.2).
+2. Validate paths and `END` boundaries (§5.3), then build or reuse the trie plan.
+3. Read the scoring position, then each branch node in the plan (§7.2).
+4. Score (§7.3) and record every path's probability and the coverage (§6).
 
-Preview stops after step 1. It displays the fixed context and all alternatives,
-not a selected path or final readout plan. Backend scores are neither available
-nor needed to inspect prompt rendering.
+Preview stops after step 2 and shows the plan. Scores are neither available nor
+needed to inspect the prompt, the paths, or the readouts.
 
 A single-entry immutable plan memo is sufficient. Its key is the ordered
-candidate-to-selected-path mapping plus `END`, not merely the candidate strings
-or both possible forms. Two prompts can compile to the same alternatives but
-choose different paths, with different branch points. Always redo score-based
-selection per measurement, even on a plan cache hit.
-
-Cache only pure plan data, never context text, first-token scores, logits, or
-model/KV state. Input order, eviction, and preview calls cannot affect results.
-Reusing a plan does not avoid validating a new context. Later encoding caches
-require a tested profile guarantee and profiling evidence.
+candidate-to-paths mapping plus `END`. Cache only pure plan data, never prompt
+text, scores, logits, or model/KV state. Input order, eviction, and preview calls
+cannot affect results. Reusing a plan does not skip encoding and validating a
+new prompt.
 
 ### 8.4 Walkthrough and regression cases
 
-A non-reasoning Gemma-style answer opening is `"<start_of_turn>model\n"`.
-Optional assistant prefills remain literal:
+With a byte-level tokenizer and a chat header ending in a newline, the candidate
+`"yes"` is scored as follows. Token boundaries are shown with `|`.
 
-| Final assistant prefill | End of fixed context | Possible completed endings |
-|---|---|---|
-| None | `"model\n"` | `"model\npositive"`, `"model\n positive"` |
-| `"Answer:"` | `"model\nAnswer:"` | `"Answer:positive"`, `"Answer: positive"` |
-| `"Answer: "` | `"model\nAnswer: "` | `"Answer: positive"`, `"Answer:  positive"` |
-| `"Answer:\n\n"` | `"model\nAnswer:\n\n"` | `"Answer:\n\npositive"`, `"Answer:\n\n positive"` |
+| Final assistant prefill | Scored texts | Scoring starts after | Paths |
+|---|---|---|---|
+| None | `"\nyes"`, `"\n yes"` | the newline | `yes`, ` yes` |
+| `"Answer:"` | `"Answer:yes"`, `"Answer: yes"` | `":"` | `yes`, ` yes` |
+| `"Answer: "` | `"Answer: yes"`, `"Answer:  yes"` | `":"` (the space merges) | ` yes`, ` | yes` |
+| `"Answer:\n\n"` | `"Answer:\n\nyes"`, `"Answer:\n\n yes"` | the newlines (when they do not re-split) | `yes`, ` yes` |
 
-The model's first-token scores select one form for each candidate at that context.
-Whitespace already in the prefill is neither removed nor moved into the answer.
-Added newline/tab/multiple-space surfaces are not considered. Such text can still
-be supplied explicitly as prefill or as literal candidate content.
+A prefill's whitespace is never removed. A trailing space in a prefill states
+that the answer starts with a space, so both scored texts contain it.
 
-**Different segmentations and changing branches.** Suppose a tokenizer produces:
+**Different segmentations.** Suppose a tokenizer produces:
 
 | Candidate | Bare | Spaced |
 |---|---|---|
 | positive | `["pos", "itive"]` | `[" positive"]` |
 | position | `["pos", "it", "ion"]` | `[" position"]` |
 
-These are illustrative paths, not a claim about a particular model's vocabulary.
-The initial query requests the three distinct ids for `"pos"`, `" positive"`,
-and `" position"`.
+These are illustrative paths, not a claim about a particular vocabulary. The
+scoring position allows `"pos"`, `" positive"` and `" position"`. With
+`p(" positive") = 0.40`, `p("pos") = 0.30` and `p(" position") = 0.20` (sum 0.90),
+and `p("itive") = 0.6`, `p("it") = 0.4` after `"pos"`:
 
-- If both spaced tokens beat `"pos"`, the selected trie has two single-token
-  paths. Normalize over those two tokens; no later query is needed.
-- If `p(" positive") = 0.40`, `p("pos") = 0.30`, and
-  `p(" position") = 0.20`, select spaced positive and bare position. The root
-  normalizer is `0.40 + 0.30`; credences are `4/7` and `3/7`.
-  After `"pos"`, `"it"` and `"ion"` are forced, with no further readout.
-- If `"pos"` beats both spaced tokens, both labels select bare paths.
-  The selected root has only `"pos"`, so it is forced with probability 1.
-  Query at `C + ["pos"]` to compare `"itive"` with `"it"`; after `"it"`,
-  `"ion"` is forced. Do not count `"pos"` twice at the root.
+```text
+credence(positive) = (0.40 + 0.30 * 0.6) / 0.90 = 0.6444
+credence(position) = (0.20 + 0.30 * 0.4) / 0.90 = 0.3556
+```
 
-No internal whitespace variants are introduced in any case. Selecting a complete
-path preserves whichever suffix that surface's tokenizer encoding specified.
+After `"it"`, `"ion"` is forced. Two readouts: the scoring position and `"pos"`.
 
 Regression coverage:
 
 - Scalar chat prompt and equivalent user-only messages compile identically.
   Completed few-shot turns remain completed.
-- No prefill, empty prefill, punctuation, trailing space, and trailing-newline
-  prefills retain exact text. Native controls and bypass occur exactly once.
-- Both surfaces decode exactly after the fixed context, including multibyte
-  text and tokenizers with dummy-space preprocessing. Unsupported profiles raise
-  before inference; context tokens never change.
-- Different segmentation lengths and suffixes; no first-token-only substitution.
-  Extra surface variants and noncanonical segmentations remain excluded.
-- Shared first ids are queried once. Equal finite or `-inf` scores select bare
-  deterministically, independently of candidate order.
-- The three selected-trie shapes above, including a root selection query when the
-  resulting root is forced, and newly absent/present downstream branches.
+- No prefill, empty prefill, punctuation, trailing-space and trailing-newline
+  prefills keep their exact text, including on templates that trim it. Native
+  controls and bypass occur exactly once.
+- Every spelling round-trips exactly in context, including multibyte text and
+  SentencePiece tokenizers. The scoring position moves only when prompt text
+  merges into answers, and is shared across candidates that merge differently.
+- Different segmentation lengths and suffixes; no first-token-only substitution;
+  no non-canonical segmentations.
+- Shared first ids are queried once; a path shared by both spellings counts once.
 - Mixed finite/`-inf` scores, all-`-inf` uniform token fallback, and forced steps.
   Zero incoming mass stays zero; token-uniform need not mean label-uniform.
-- Preview shows alternatives, not selections. It shares preparation, makes no
-  backend calls, and does not mutate later selection or measurements.
+- Preview shows the same prompt, paths, and plan that measurement uses, makes no
+  backend calls, and does not change later measurements.
 - Cold, reused, rebuilt, and preview-interleaved measurements agree within
-  backend numerical tolerance. Equal alternatives with different initial scores
-  must not accidentally reuse an obsolete selected trie.
+  backend numerical tolerance.
 
 ## 9. Reasoning models: bypass only in v1
 
@@ -1075,20 +1111,31 @@ class FullLogitsBackend(Protocol):
 
     def next_token_logits(
         self, token_ids: Sequence[int], wanted: Sequence[int]
-    ) -> dict[int, float]:
+    ) -> TokenScores:
         """Raw logits of every requested token at the next position.
 
         Values are float32 model logits. `wanted` restricts the returned values,
         not which logits the model is capable of exposing. Every requested id
         must be present; the backend never samples or truncates to top-K.
         """
+
+@dataclass(frozen=True)
+class TokenScores:
+    logits: Mapping[int, float]   # every requested id
+    log_normalizer: float         # logsumexp of the logits over the whole vocabulary
 ```
+
+`log_normalizer` costs one reduction over logits the model has already computed.
+credences uses it only for coverage at the scoring position (§6.5); it never
+enters credences. It must be finite and at least the logsumexp of the returned
+requested logits, allowing float32 roundoff; otherwise raise
+`BackendReadoutError`.
 
 A missing requested id is a backend contract violation: raise
 `BackendReadoutError`, not a zero probability. Reject NaN or positive infinity
 with the same error. Negative infinity represents zero weight when any allowed
 score is finite; an all-`-inf` allowed set triggers uniform token fallback (§5.1).
-The backend returns the raw scores; selection, forcing, and fallback belong to
+The backend returns the raw scores; masking, forcing, and fallback belong to
 the pure measurement logic, not a backend-specific repair.
 
 The tokenizer adapter exposes:
@@ -1113,12 +1160,13 @@ passes each flag explicitly and any tokenizer accepting these keywords conforms.
 
 The model profile chooses compatible rendering flags; do not open a new assistant
 turn and continue a final message simultaneously. The adapter preserves the
-special-token policy required by §8. Its tokenizer-bound profile must preserve
-an optional final assistant prefill and implement the validated canonical
-continuation encoder (§8.2). Neither operation belongs in the backend protocol.
+special-token policy required by §8. Its tokenizer-bound profile must keep an
+optional final assistant prefill exactly (§8.1) and implement the validated
+in-context encoder (§8.2). Neither operation belongs in the backend protocol.
 
-The Credoscope normalizes only over allowed tokens. No full-vocabulary softmax
-or transfer of the full vocabulary distribution to the caller is required.
+The Credoscope normalizes only over allowed tokens. Beyond the one
+`log_normalizer` value, no full-vocabulary softmax or transfer of the full
+vocabulary distribution to the caller is required.
 No `generate`, `create_cache`, `copy_cache`, or low-level `forward` methods are
 part of this protocol. Intra-measurement KV reuse is backend-internal; its request
 lifetime is an implementation review item (§13, §16).
@@ -1143,9 +1191,9 @@ map candidate strings back to semantic labels. Those operations have different
 research assumptions and should not complicate the measurement primitive.
 
 The caller also owns any final assistant prefill, supplied through `messages=`.
-The library adds no answer cue. It owns only the two-form continuation policy
-(§4.3, §8), keeping native model formatting separate from research instructions,
-semantic descriptions, and randomized code meanings.
+The library adds no answer cue. It owns only candidate trimming and the
+two-spelling policy (§4.1, §4.3, §8), keeping native model formatting separate
+from research instructions, semantic descriptions, and randomized code meanings.
 
 For a coded prompt, a caller might build a Credoscope over `["A", "B", "C"]`,
 retain a per-input mapping such as `{"A": "neutral", "B": "positive", "C":
@@ -1177,7 +1225,7 @@ src/credences/
                      # runs trie plans against a backend;
                      # the ONLY module that drives backends
   probabilities.py   # pure: result dataclasses + §5 math, summaries, and tie helpers
-  trie.py            # pure: first-token path selection, §7 trie, readout plans, validation
+  trie.py            # pure: §7 trie over every spelling path, readout plans, validation
   types.py           # pure: Message + ChatSpec types
   tokenization.py    # tokenizer-bound, backend-free: §8 boundary contract + Tokenizer protocol
   reasoning.py       # tokenizer-bound, backend-free: ReasoningProfile, detection, blessed registry
@@ -1202,7 +1250,7 @@ Three dependency tiers, and the import-linter check in CI enforces the first rul
 
 V1 ships **no cross-call inference/KV cache**. Loaded model weights and tokenizer
 objects are reused across calls; prompt-dependent state and scores are not.
-Reusing an immutable selected-trie plan (§8.3) is a separate, pure optimization.
+Reusing an immutable trie plan (§8.3) is a separate, pure optimization.
 Within one measurement, the backend may reuse context and trie-prefix KV state,
 but only with an explicit request lifetime and cleanup on both success and error.
 Until that internal lifecycle is reviewed, recomputing each requested context is
@@ -1231,6 +1279,13 @@ golden-parity test** (identical inputs → outputs within FP tolerance of the Py
 reference) before being trusted, then benchmarked. Measure tokenization, model
 prefill, and trie traversal separately before selecting an optimization.
 
+One candidate optimization, only if profiling shows branch readouts matter:
+skip the readouts below a first token whose probability at the scoring position
+is under a small tolerance (for example 0.1%), splitting its mass as the
+candidate's other spelling splits. The error is bounded by that tolerance, and
+the measurand in §5.1 stays fixed; a tolerance must never decide which spellings
+count.
+
 ## 14. Testing
 
 Three tiers; every test guards a named failure mode — no tests written just to
@@ -1240,14 +1295,16 @@ raise the test-coverage number.
 backend implements `FullLogitsBackend` over a ~10-token vocabulary with declared
 logits. Properties:
 
-- **Two-stage parity (the load-bearing one):** first-token selection followed by
-  selected-trie scoring equals independent selection plus a naive chain rule.
-  Include the §8.4 changing branch shapes and root readout reuse. Normalizing
-  candidate maxima before merging shared first tokens must fail parity.
-- First-token score ties select the named bare form, not whichever form was
-  inserted first. Shared edges count once; cross-label path collisions and empty
-  paths raise. Candidate iteration order cannot alter selection or credences
-  beyond floating-point tolerance.
+- **Summed-spelling parity (the load-bearing one):** trie scoring equals an
+  independent reference that enumerates every path, applies the naive chain
+  rule, and sums each candidate's paths. Include the §5.2 and §8.4 shapes, paths
+  shared by both spellings, and spellings that start with the same token.
+  Keeping only the stronger spelling, or normalizing per candidate before
+  merging shared first tokens, must fail parity.
+- Shared edges count once; a path shared by a candidate's two spellings counts
+  once; cross-label path collisions, empty paths, and a candidate's path that
+  prefixes its own other path raise. Candidate iteration order cannot alter
+  credences beyond floating-point tolerance.
 - Credences sum to 1 within FP tolerance (per-node masked probabilities over the
   allowed set sum to 1 by construction; log-space accumulation adds rounding);
   an all-`-inf` allowed set yields `1 / len(allowed)` per distinct token. Mixed
@@ -1256,7 +1313,7 @@ logits. Properties:
   `-inf`, and need no query. Test token-uniform but label-nonuniform outcomes.
 - End-vs-continue: `p̃(END) + Σ p̃(continuations) == 1` at the node; the §5.3/§7.1
   `END`-disjointness `ValueError` fires on an overlapping pair; a prefix overlap
-  with no resolvable `END` fails potential-path validation before inference.
+  with no resolvable `END` fails path validation before inference.
   All-`-inf` fallback with multiple end ids aggregates their token-uniform mass.
 - Log-space robustness at extreme logits, including explicit uniform fallback
   without `-inf - (-inf)`: finite log credences remain finite
@@ -1265,14 +1322,17 @@ logits. Properties:
 - Exact ties return all winners in candidate order, with no randomization or
   rounding-induced ties. Caller-seeded tie selection only returns winners;
   fractional weights sum to one and are distinct from the credence vector.
-- Duplicate or empty candidates raise as specced.
-- Overlapping accepted surface sets, such as `"positive"` and `" positive"`,
-  raise before scoring rather than sharing a response between result keys.
+- Candidates are trimmed at both ends only; internal whitespace is kept; result
+  keys stay as supplied. Candidates that are empty or duplicated after trimming,
+  such as `"positive"` and `" positive"`, raise before scoring.
+- Coverage equals the full-vocabulary probability of the allowed first tokens,
+  is always defined (a singleton scoring position is still read), and does not
+  change credences. An invalid `log_normalizer` raises `BackendReadoutError`.
 - Construction rejects fewer than two candidates; scalar input returns `Measurement`,
   sequence input preserves order and length, and empty sequence input returns `[]`.
 - Preview returns `str` or aligned `list[str]` under the same input dispatch;
   preparation errors match measurement, no backend calls occur, and reports show
-  alternatives without claiming a selected path or final plan. No automatic
+  the same paths and readout plan that measurement uses. No automatic
   print/log/file side effects.
 - Missing requested backend scores or invalid numeric scores raise
   `BackendReadoutError`, never silently renormalize an incomplete readout.
@@ -1280,23 +1340,24 @@ logits. Properties:
 **Tier 2 — tokenizer-only tests (real tokenizers, no model weights).** Gated on
 network/fixture availability, not on hardware — this is the highest-value
 regression surface and must run in ordinary CI. Per blessed-registry entry: §8.2
-fixed-context canonical continuation encoding and exact decoding of both forms;
-the §8.4 prompt/message/prefill cases; bypass inserts and native-disable kwargs;
-different whole-form segmentations and potential-path validation. Reject
-unsupported rendering/encoding before calling a model. Include assistant
-prefills with no trailing whitespace, a trailing space, and trailing newlines.
-Preview/measurement preparation parity and faithful report rendering (§4.4) must
-cover these same cases, including a user message that itself ends in `"Answer:"`.
-With fake first-token scores on those real paths, test cold/warm/rebuilt selected
-plans and changing selections even when tokenization is unchanged.
+in-context encoding with exact round trips for both spellings; the scoring
+position, including a trailing-space prefill that merges into the answer and
+candidates that merge differently (`"yes"` with `"1"`); the §8.4
+prompt/message/prefill cases, including templates that trim the prefill; no
+doubled beginning-of-sequence token; bypass inserts and native-disable kwargs;
+different whole-spelling segmentations and `END` validation. Reject unsupported
+rendering/encoding before calling a model. Preview/measurement preparation
+parity and faithful report rendering (§4.4) must cover these same cases,
+including a user message that itself ends in `"Answer:"`. With fake scores on
+those real paths, test cold/warm/rebuilt plans.
 
 **Tier 3 — opt-in real-model e2e (`CREDENCES_RUN_MLX_TESTS=1`).** Against the
 blessed registry's sanity prompts: expected top label and minimum top-label credence,
 bypass sanity on at least one `</think>`-family and one Harmony-family model.
 
 Golden fixtures: a hand-built fake-backend scenario per interesting shape —
-two single-token alternatives with unequal scores and exact ties;
-the three `"positive"`/`"position"` selected-trie shapes (§8.4);
+two single-token candidates with unequal scores and exact ties;
+the `"positive"`/`"position"` example (§8.4);
 shared-prefix multi-token (the §5.2 five-candidate
 example, with its hand-computed credences); prefix overlap with an
 end-vs-continue node (`"increase"`/`"increase substantially"`, expected credences
@@ -1331,14 +1392,16 @@ reimplementation.
 - **Model loading and dependency tiers:** choose the backend-construction entry
   point before wiring `load_model`. A protocol-typed `model.py` cannot also import
   runtime implementations while claiming to be backend-free (§12).
-- **Supported-model validation:** verify fixed-context continuation encoding of
-  both forms with real tokenizer fixtures before declaring support. Validate native
-  assistant opening, faithful prefill rendering, and any tokenizer-specific
-  suppression of a dummy initial space. A failed fixture calls for an explicit
-  profile decision, never context rewriting or silently dropping a form.
-- **Broader variants / synonym sets:** v1 accepts only the canonical bare and
-  single-ASCII-space forms. Newline/tab/case variants, synonyms, and enumeration
-  of all tokenizations are deferred to `POSSIBLE_FUTURE_EXTENSIONS.md` §10.
+- **Supported-model validation:** verify in-context encoding of both spellings
+  with real tokenizer fixtures before declaring support. Validate native
+  assistant opening, exact prefill rendering (including restored trailing
+  whitespace), and exact round trips. A failed fixture calls for an explicit
+  profile decision, never rewriting prompt text or silently dropping a spelling.
+- **Broader variants / synonym sets:** v1 scores only the bare and
+  single-ASCII-space spellings in their canonical tokenizations. A possible
+  extension lets callers list accepted spellings per candidate (for example
+  `"Yes"` and `"yes"`), summed the same way; newline/tab variants and
+  non-canonical tokenizations stay out. See `POSSIBLE_FUTURE_EXTENSIONS.md` §10.
 - Generated reasoning, post-reasoning measurement, post-trace prefill interactions, and
   multi-sample averaging are deferred to `POSSIBLE_FUTURE_EXTENSIONS.md` §8.
   V1 supports only `reasoning="bypass"`.
@@ -1355,5 +1418,12 @@ reimplementation.
   for LLMs via Conditional Probabilities*, NBER Working Paper 34965, 2026 ("CDS").
 - Park et al., [*Grammar-Aligned Decoding*](https://arxiv.org/abs/2405.21047),
   NeurIPS 2024.
+- R. L. Geh, H. Zhang, K. Ahmed, B. Wang, G. Van den Broeck,
+  [*Where is the signal in tokenization space?*](https://arxiv.org/abs/2408.08541),
+  EMNLP 2024.
+- S. Lundberg, M. T. Ribeiro, [*The Art of Prompt Design: Prompt Boundaries and
+  Token Healing*](https://github.com/guidance-ai/guidance/blob/main/notebooks/art_of_prompt_design/prompt_boundaries_and_token_healing.ipynb), 2023.
+- EleutherAI, [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness),
+  `_encode_pair` in `lm_eval/api/model.py`.
 - "On the attribution of confidence to large language models," *Inquiry*, 2025 —
   terminology-in-ML for credence attribution.

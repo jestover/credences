@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Revise the measurement design (SPEC §4–§8, §10, §14; DECISIONS D3, D5, D14,
+  D16; AGENTS): candidates are trimmed at the ends; each candidate's credence is
+  the sum of its bare and single-space spellings, scored in one trie, replacing
+  first-token selection of one spelling; spellings are encoded together with the
+  prompt and scored from the longest token prefix they share with it, with exact
+  round trips; prefills are kept exactly, restoring trailing whitespace that
+  chat templates trim; and `RawReadout` gains per-path probabilities and a
+  `coverage` diagnostic, which needs the backend to return a full-vocabulary log
+  normalizer. Based on tests of nine tokenizer families and Geh et al. (EMNLP
+  2024). The pure core still implements selection; PLAN Phase 1b brings the code
+  in line.
 - Complete Phase 1: add chat message types with structural validation
   (`credences.types`), the `Tokenizer` and `FullLogitsBackend` interfaces, and a
   protocol-conforming fake tokenizer and backend for tests. ty checks the fakes

@@ -50,9 +50,10 @@ approximate silently.
   logits from the backend, renormalized over the allowed set at each branch node
   by the Credoscope (SPEC §5). Any
   change to probability math updates the trie-vs-naive **parity property test
-  first** (SPEC §14). Compare both first-token scores, select one complete path
-  per candidate, and score only the selected trie. Merge shared prefixes before
-  normalization; never count a shared first token once per label.
+  first** (SPEC §14). Score every spelling path of every candidate in one trie;
+  a candidate's credence is the sum of its paths. Never keep only one spelling.
+  Merge shared prefixes before normalization; never count a shared first token
+  once per label or per spelling, and count a path shared by both spellings once.
 - Force singleton transitions to probability 1 without querying them. All-`-inf`
   branches use uniform probability over distinct allowed token ids. With any
   finite score, `-inf` tokens get zero. Missing/NaN/positive-infinity scores remain
@@ -60,27 +61,33 @@ approximate silently.
 - The answer boundary (SPEC §8) and reasoning inserts (SPEC §9.1) are the two
   easiest places to silently corrupt every number. Touch them only with Tier-2
   tokenizer tests in hand.
-- `Measurement.raw.scored_token_ids` records each candidate's selected complete
-  path, not discarded alternatives or a complete inference trace. Preview shows
-  both alternatives. Do not silently change what these fields claim to expose.
+- `Measurement.raw.scored_paths` records every scored path with its text, tokens,
+  and probability; the paths sum to the credence. Preview shows the same paths
+  and the readout plan. Do not silently change what these fields claim to expose.
 - Every requested backend score must be returned. Missing scores are contract
   errors, not zeros. Do not add a restricted top-K backend to the core.
+- `raw.coverage` is a diagnostic only. Never let it change credences, filter or
+  reweight results, or trigger warnings; low coverage is not low accuracy.
 - Return all exact `top_labels`; random selection is an explicit helper with a
   caller-supplied RNG. Preserve finite log credences through probability underflow.
-- Admit exactly `candidate` and `" " + candidate`, with one canonical continuation
-  path per surface (SPEC §4.3, §8). Encode whole forms, never toggle whitespace
-  between internal tokens or enumerate alternate segmentations. Select by
-  first-token logits, preferring the named bare form on exact ties; preserve its
-  entire suffix. Reject cross-label path ownership collisions.
+- Trim candidates at both ends only; keep internal whitespace; keep result keys
+  as supplied. Score exactly `candidate` and `" " + candidate`, each in its one
+  canonical tokenization (SPEC §4.1, §4.3). Never toggle whitespace between
+  internal tokens, add case or newline variants, or add non-canonical
+  tokenizations. Reject cross-label path ownership collisions.
+- Encode each spelling together with the prompt text, never on its own; score
+  from the longest token prefix shared by the prompt and every spelling, and
+  require exact round trips (SPEC §8.2). Never encode rendered chat text with
+  automatic special tokens.
 - Callers supply optional assistant prefills through `messages=`. Add no answer
-  cue. Render native controls and bypass before that prefill, then freeze `C`.
-  Continuation encoding must preserve all context tokens and decode to each exact
-  surface; handle tokenizer dummy-space rules explicitly or raise. Never trim a
-  prefill, repair context by re-encoding it, or silently omit a form.
+  cue. Render native controls and bypass before that prefill. Prompt and prefill
+  text are never changed: restore trailing whitespace a template trims, and
+  raise on any other template change. The token boundary may move to the shared
+  prefix; the text may not. Never silently omit a spelling.
 - `.preview()` must use measurement's exact preparation path, without any backend
-  inference. Show full context, visible whitespace, and both possible paths, not
-  selected paths or the final readout plan; do not
-  silently simplify, truncate, log, or repair the researcher's prompt (SPEC §4.4).
+  inference. Show the full prompt, visible whitespace, where scoring starts, every
+  scored path, and the readout plan; do not silently simplify, truncate, log, or
+  repair the researcher's prompt (SPEC §4.4).
 
 ## Defaults and discipline
 
@@ -107,14 +114,15 @@ approximate silently.
   multi-attribute modes, scheduling, or checkpointing (`DECISIONS.md` D2, D12).
 - Task-prompt construction, code assignment, option randomization, and semantic
   remapping stay outside the core (`DECISIONS.md` D6). The Credoscope knows the
-  candidate strings and two-form policy, not their semantic mappings.
-- Broader surface variants and synonym sets are deferred. Beyond the bare and
-  one-additional-ASCII-space forms, do not add whitespace, case, or tokenization
-  alternatives. Score-based selection is limited to the specified two forms.
+  candidate strings and two-spelling policy, not their semantic mappings.
+- Broader spelling variants and synonym sets are deferred. Beyond the bare and
+  one-additional-ASCII-space spellings, do not add whitespace, case, or
+  tokenization alternatives. A pruning tolerance may only approximate the fixed
+  measurand with bounded error, never decide which spellings count.
 - No cross-call inference/KV caching in v1; reuse the loaded model weights.
-  A bounded pure plan memo requires identical **selected** paths and `END`.
-  Recompute selection per measurement; never cache prompts or first-token scores.
-  Optimizations require profiling and parity tests (SPEC §13).
+  A bounded pure plan memo requires identical paths and `END`; never cache
+  prompts, scores, or logits. Optimizations require profiling and parity tests
+  (SPEC §13).
 - Measurement calls stay independent and free of cross-call semantic state. Cluster
   workers load one locally available model, build one Credoscope, and process
   independently retryable shards; scheduling and weight staging stay outside the
@@ -204,8 +212,8 @@ background watcher for pushes made elsewhere.
 - Public surface still reduces to model loading, build-a-Credoscope, `.measure()`,
   inspection-only `.preview()`, result types, optional tie helpers, and optional
   frame conversion?
-- Prefills and task wording stay caller-owned, with only the two starting forms
-  supplied by the library and no context rewriting?
+- Prefills and task wording stay caller-owned and unchanged, with only end
+  trimming of candidates and their two spellings supplied by the library?
 - New tests guard a concrete failure mode, not incidental internals?
 - Probability math touched ⇒ property test updated first, parity test still green?
 - Anything experimental (such as model-profile rendering assumptions) changed ⇒
