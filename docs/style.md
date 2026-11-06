@@ -15,6 +15,8 @@ coding guide.
   aliases, and `UPPER_SNAKE_CASE` for constants.
 - Let Ruff sort imports. Keep standard-library, third-party, and package imports
   separate. Existing same-package relative imports are fine.
+- Start a name with an underscore when it is not part of the public API, and
+  define it in the module that uses it. Tests may import such names.
 - Use modern Python syntax appropriate for Python 3.14. Do not rewrite clear
   numerical code merely to shorten it.
 
@@ -27,6 +29,10 @@ finishing, reread the text as that person would. If they would need
 
 - Say what the object or function does and when to use it, in plain words,
   before any edge cases.
+- Keep the README to what the package is for and what its results mean.
+  Tokenization, spellings, and prompt boundaries belong in
+  `docs/tokenization.md`, written for a reader fluent in math and statistics
+  (say, with a PhD in finance) who has never looked inside a language model.
 - Define project terms on first use, or use the module docstring's
   definitions: logit, log probability, credence, token path, bare and spaced
   encodings, END tokens. Avoid internal shorthand such as "root",
@@ -89,6 +95,8 @@ Raises:
 Do not add empty sections or repeat every field description in the constructor.
 A short constructor docstring may refer to meanings already explained by its
 class. Private helpers can have short descriptions when their contract is simple.
+A helper that trusts its input must say what it requires and what happens if
+the input breaks that requirement, and its types should rule out what they can.
 
 Non-obvious implementation rationale belongs in sparse comments near the code.
 Do not turn docstrings or comments into a line-by-line implementation tutorial.

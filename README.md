@@ -19,14 +19,12 @@ or the gap between the top two answers.
 
 Early development. The package is not yet on PyPI.
 
-- **Available now:** the scoring math and result types. Given the token IDs
-  for each answer and a model's logits (raw next-token scores), `credences`
-  computes each answer's probability, confidence summaries, and JSON output.
-  The interfaces a model backend and its tokenizer will implement
-  (`credences.backends.FullLogitsBackend`, `credences.tokenization.Tokenizer`)
-  and the chat message types (`credences.types`) are defined too.
-- **Not yet available:** tokenizing answers, loading a model, and a one-call
-  measurement API. The planned API looks like this:
+- **Available now:** the scoring math and the result types described below.
+  They work on model scores you supply; the
+  [walkthrough](docs/pure-core.md) shows them step by step. The interfaces a
+  model backend will implement are defined too.
+- **Not yet available:** loading a model and the one-call measurement API. The
+  planned API looks like this:
 
   ```python
   # Planned; not implemented yet.
@@ -38,69 +36,18 @@ Early development. The package is not yet on PyPI.
   result.credences
   ```
 
-## How answers are scored
+## What the numbers mean
 
-A model writes one token at a time, and an answer such as `"very positive"`
-may be several tokens. To get one probability per answer:
+The credences sum to 1 across your answers. They describe how the model divides
+its probability among the answers you listed, for that prompt: in effect, how
+often it would give each one if it had to answer with one of them. They are not
+guaranteed to be calibrated, and a different wording of the prompt can give
+different credences.
 
-1. **Two spellings of each answer.** Each answer is scored as written and
-   with one space in front, because whether a model writes that space depends
-   on what comes before the answer. An answer's probability is the total of
-   both. Spaces around your answers are trimmed (`" yes "` is scored as
-   `"yes"`); spaces inside them are kept.
-2. **Encoded with your prompt.** Each spelling is turned into tokens together
-   with the prompt, the way the model would see the full text. Your prompt and
-   any prefill are used exactly as written. If their last characters merge with
-   the answer, such as a trailing space in `"Answer: "`, that text is scored as
-   the start of the answer so the model sees its usual tokens.
-3. **Score only the allowed tokens.** At each step, the model's scores for the
-   tokens the answers allow there are turned into probabilities among those
-   tokens alone, ignoring the rest of the vocabulary.
-4. **Multiply along each answer.** A spelling's probability is the product of
-   its steps. Answers that start with the same token share that step's
-   probability instead of each counting it in full. When one answer is the
-   start of another (`"up"` and `"upward"`), the model's choice to stop is read
-   from its end-of-answer tokens.
-
-The resulting probabilities sum to 1 over your answers. They describe how the
-model divides its belief among the answers you gave, for that prompt; they are
-not guaranteed to be calibrated. Other ways of writing an answer, such as a
-capitalized `"Yes"` or a newline before it, are not counted, so write your
-answers the way your prompt asks for them.
-
-## Try it
-
-You need [uv](https://docs.astral.sh/uv/) and Python 3.14. From a clone of
-this repository:
-
-```bash
-uv sync --group dev
-```
-
-The current version works on token IDs and logits you provide. Here, two
-one-token answers use made-up token IDs and logits:
-
-```pycon
->>> from credences.probabilities import TokenScores, measurement_from_raw
->>> from credences.trie import CandidatePaths, build_trie
->>> plan = build_trie(
-...     {
-...         "yes": CandidatePaths(bare=[10], spaced=[11]),  # "yes" is token 10, " yes" is 11
-...         "no": CandidatePaths(bare=[20], spaced=[21]),  # "no" is token 20, " no" is 21
-...     }
-... )
->>> logits = {10: 2.0, 11: 0.5, 20: 1.0, 21: -0.5}  # the model's scores for each token
->>> raw = plan.score({(): TokenScores(logits, log_normalizer=3.0)}, context_token_count=12)
->>> result = measurement_from_raw(raw)
->>> {label: round(p, 3) for label, p in result.credences.items()}
-{'yes': 0.731, 'no': 0.269}
->>> result.top_labels
-('yes',)
-
-```
-
-For multi-token answers, shared first tokens, and saving results, follow the
-[walkthrough of the scoring core](docs/pure-core.md).
+Only your answers, as you wrote them, are counted. To a model, `"Yes"` and
+`"yes"` are different answers, so list your answers in the form your prompt
+asks for. [How answers become tokens](docs/tokenization.md) explains how
+answers are matched to the model's output, and why.
 
 ## What a measurement contains
 
@@ -118,14 +65,15 @@ p2:
 
 Each confidence summary runs from 0 to 1, and is 1 when one answer has all
 the probability.
+
 `measurement.raw` keeps the exact log probabilities, which stay meaningful even
-for answers too unlikely to show as anything but 0.0, and how much each spelling
-of each answer contributed. It also reports **coverage**: how likely the model
-was, before being limited to your answers, to start one of them. Coverage
-describes the model's habits, not the measurement's accuracy. A model that
-likes to open with "The" can have low coverage and exactly the same credences as
-one that answers directly. `measurement.to_dict()` gives a copy you can save as
-JSON.
+for answers too unlikely to show as anything but 0.0, and a breakdown of how
+each answer's probability was put together. It also reports **coverage**: how
+likely the model was, before being limited to your answers, to start one of
+them. Coverage describes the model's habits, not the measurement's accuracy. A
+model that likes to open with "The" can have low coverage and exactly the same
+credences as one that answers directly. `measurement.to_dict()` gives a copy
+you can save as JSON.
 
 Ties are never broken silently. Use `choose_top_label(result, rng=...)` to pick
 one winner with your own random generator, or `top_label_weights(result)` to
@@ -133,6 +81,8 @@ split a win equally when counting results.
 
 ## Documentation
 
+- [How answers become tokens](docs/tokenization.md): what exactly is scored,
+  written for readers new to how language models work.
 - [Walkthrough of the scoring core](docs/pure-core.md): runnable examples from
   token IDs to a saved result.
 - API reference: the docstrings, for example `help(credences.trie)`. Their
@@ -142,7 +92,8 @@ split a win equally when counting results.
 
 ## Contributing
 
-Run the checks before sending a change:
+You need [uv](https://docs.astral.sh/uv/) and Python 3.14. Run the checks
+before sending a change:
 
 ```bash
 uv sync --locked --group dev
@@ -154,8 +105,8 @@ uv run pytest
 uv build
 ```
 
-`uv run pytest` needs no model weights. It also runs the examples in this
-README, the walkthrough, and the docstrings.
+`uv run pytest` needs no model weights. It also runs the examples in the
+walkthrough and the docstrings.
 
 These documents describe the design and how to work on it:
 

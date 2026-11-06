@@ -8,7 +8,8 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from credences import RawReadout, ScoredPath, choose_top_label, top_label_weights
-from credences.probabilities import masked_logprobs, measurement_from_raw
+from credences.probabilities import measurement_from_raw
+from credences.trie import _masked_logprobs
 
 
 def _raw(logs, **changes):
@@ -94,7 +95,7 @@ def test_multiclass_top_and_entropy_confidence_can_rank_vectors_differently():
     )
 )
 def test_summaries_match_definitions_and_are_invariant_to_candidate_order(scores):
-    logs = masked_logprobs(list(range(len(scores))), dict(enumerate(scores)))
+    logs = _masked_logprobs(dict(enumerate(scores)))
     raw = _raw({str(token): value for token, value in logs.items()})
     result = measurement_from_raw(raw)
     probabilities = list(result.credences.values())
@@ -170,67 +171,10 @@ def test_factory_never_renormalizes_candidate_credences_or_rewrites_raw_logs():
     assert result.raw.scored_paths["A"][0].token_ids == (0,)
 
 
-def test_factory_owns_scored_paths_built_from_caller_lists():
-    spellings, tokens = ["bare"], [0]
-    paths = {
-        "A": (ScoredPath(spellings, tokens, math.log(0.6)),),
-        "B": (ScoredPath(("bare",), (1,), math.log(0.4)),),
-    }
-    result = measurement_from_raw(
-        _raw({"A": math.log(0.6), "B": math.log(0.4)}, scored_paths=paths)
-    )
-    spellings.append("spaced")
-    tokens.append(99)
-
-    assert result.raw.scored_paths["A"][0].spellings == ("bare",)
-    assert result.raw.scored_paths["A"][0].token_ids == (0,)
-
-
 def test_factory_rejects_mass_off_by_more_than_roundoff():
     # 5e-13 of excess log mass is roundoff (above); 1e-10 is a real error.
     with pytest.raises(ValueError, match="sum to"):
         measurement_from_raw(_raw({"A": math.log(0.6), "B": math.log(0.4) + 1e-10}))
-
-
-def test_factory_sums_a_candidates_spellings_and_rejects_paths_that_disagree():
-    logs = {"A": math.log(0.6), "B": math.log(0.4)}
-    both = (
-        ScoredPath(("bare",), (0,), math.log(0.45)),
-        ScoredPath(("spaced",), (1,), math.log(0.15)),
-    )
-    paths = {"A": both, "B": (ScoredPath(("bare",), (2,), math.log(0.4)),)}
-    assert measurement_from_raw(_raw(logs, scored_paths=paths)).credences["A"] == (
-        pytest.approx(0.6)
-    )
-
-    paths["A"] = both[:1]
-    with pytest.raises(ValueError, match="add up"):
-        measurement_from_raw(_raw(logs, scored_paths=paths))
-
-
-def test_factory_rejects_a_candidate_without_scored_paths():
-    logs = {"A": math.log(0.6), "B": math.log(0.4)}
-    paths = {"A": (), "B": (ScoredPath(("bare",), (2,), math.log(0.4)),)}
-
-    with pytest.raises(ValueError, match="no scored path"):
-        measurement_from_raw(_raw(logs, scored_paths=paths))
-
-
-@pytest.mark.parametrize(
-    ("changes", "error", "match"),
-    [
-        ({"coverage": -0.1}, ValueError, "Coverage"),
-        ({"coverage": 1.1}, ValueError, "Coverage"),
-        ({"coverage": math.nan}, ValueError, "coverage"),
-        ({"coverage": "high"}, TypeError, "coverage"),
-        ({"context_token_count": -1}, ValueError, "token count"),
-        ({"context_token_count": True}, ValueError, "token count"),
-        ({"context_token_count": 1.5}, ValueError, "token count"),
-    ],
-)
-def test_factory_rejects_invalid_coverage_and_prompt_token_counts(changes, error, match):
-    with pytest.raises(error, match=match):
-        measurement_from_raw(_raw({"A": math.log(0.6), "B": math.log(0.4)}, **changes))
 
 
 @pytest.mark.parametrize("logs", [{}, {"A": 0.0}])
@@ -253,17 +197,9 @@ def test_factory_rejects_non_normalized_logs_instead_of_inventing_label_fallback
 
 
 @pytest.mark.parametrize("value", [math.nan, math.inf, 0.1])
-def test_factory_rejects_invalid_or_positive_log_credences(value):
-    with pytest.raises(ValueError, match="log credence"):
+def test_invalid_or_positive_log_credences_fail_the_sum_check(value):
+    with pytest.raises(ValueError, match="sum to"):
         measurement_from_raw(_raw({"A": value, "B": -math.inf}))
-
-
-def test_factory_rejects_missing_candidate_paths():
-    logs = {"A": -math.log(2), "B": -math.log(2)}
-    paths = {"A": (ScoredPath(("bare",), (1,), -math.log(2)),)}
-
-    with pytest.raises(ValueError, match="same candidates"):
-        measurement_from_raw(_raw(logs, scored_paths=paths))
 
 
 def test_fractional_winner_weights_are_not_credences():

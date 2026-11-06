@@ -6,8 +6,8 @@ import pytest
 from fakes import score_with_backend
 
 from credences.errors import BackendReadoutError
-from credences.probabilities import TokenScores, logsumexp, measurement_from_raw
-from credences.trie import CandidatePaths, ReadoutRequest, SpellingPath, build_trie
+from credences.probabilities import TokenScores, measurement_from_raw
+from credences.trie import CandidatePaths, ReadoutRequest, SpellingPath, _logsumexp, build_trie
 
 CONTEXT = (90, 91)
 
@@ -27,7 +27,7 @@ class DeclaredScores:
         return TokenScores(
             logits={token: table[token] for token in wanted if token in table},
             # One unlisted vocabulary token with logit 0 keeps the normalizer finite.
-            log_normalizer=logsumexp([*table.values(), 0.0]),
+            log_normalizer=_logsumexp([*table.values(), 0.0]),
         )
 
 
@@ -83,7 +83,7 @@ def test_identical_spellings_are_one_path_counted_once():
     plan = build_trie(forms)
     raw = plan.score({(): TokenScores({0: 0.0, 1: 0.0, 2: 0.0}, 2.0)}, context_token_count=0)
 
-    assert plan.paths[0] == ("A", (SpellingPath(("bare", "spaced"), (0,)),))
+    assert plan.paths["A"] == (SpellingPath(("bare", "spaced"), (0,)),)
     assert _probabilities(raw) == pytest.approx({"A": 1 / 3, "B": 2 / 3})
 
 
@@ -262,7 +262,7 @@ def test_plan_owns_its_paths_and_is_reusable_without_semantic_state():
 
     first = score({1: 0.0, 10: 0.0})
     changed = score({1: -math.inf, 10: 0.0})
-    assert plan.paths[0][1][0].token_ids == (0,)
+    assert plan.paths["A"][0].token_ids == (0,)
     assert plan.end_tokens == (10,)
     assert first.credence_logprobs == {"A": -math.log(2), "AB": -math.log(2)}
     assert changed.credence_logprobs == {"A": 0.0, "AB": -math.inf}

@@ -9,7 +9,7 @@ import math
 from collections.abc import Mapping, Sequence
 
 from credences.backends import FullLogitsBackend, TokenScores
-from credences.probabilities import RawReadout, logsumexp
+from credences.probabilities import RawReadout
 from credences.tokenization import Tokenizer
 from credences.trie import CandidatePaths, TriePlan, build_trie
 
@@ -121,7 +121,10 @@ class DeclaredLogitsBackend:
             raise LookupError(f"No logits declared after {context}")
         table = self.tables[context]
         vocabulary = range(len(self._tokenizer.pieces))
-        log_normalizer = logsumexp(table.get(token, self.fill) for token in vocabulary)
+        logits = [table.get(token, self.fill) for token in vocabulary]
+        # A real backend computes this logsumexp itself, over its whole vocabulary.
+        peak = max(logits)
+        log_normalizer = peak + math.log(math.fsum(math.exp(value - peak) for value in logits))
         scores = {token: table.get(token, self.fill) for token in wanted}
         if self.top_k is not None:
             kept = sorted(scores, key=scores.__getitem__, reverse=True)[: self.top_k]

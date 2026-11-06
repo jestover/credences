@@ -10,21 +10,19 @@ output. To turn a snippet into a script, remove the prompts and output lines.
 
 Outputs are rounded here only for readability; the library itself never rounds.
 `uv run pytest` runs every example on this page, so they stay in step with the code.
+To try them yourself, run `uv sync --group dev` in a clone of this repository,
+then start `uv run python`.
 
 ## 1. From two spellings per answer to a scored trie
 
-### Why two spellings?
+### Two spellings
 
-A space in front of a word usually changes how a tokenizer encodes it. A
-hypothetical tokenizer might split `"positive"` into `"pos"`, `"it"`, and `"ive"`
-with IDs `[973, 184, 1784]`, while encoding `" positive"` as one token `[17384]`.
-The two spellings can differ in both length and token IDs, not just their first
-piece.
-
-Whether a model writes that space depends on what comes before the answer:
-right after a chat header that ends in a newline, answers usually start without
-one; after `"Answer:"`, they usually start with one. So credences scores both
-spellings and gives each answer their **total** probability.
+Each answer is scored as written and after one space, and its credence is the
+**total** probability of the two. [How answers become tokens](tokenization.md)
+explains why. The two spellings can differ in both length and token IDs, not
+just their first piece: a hypothetical tokenizer might split `"positive"` into
+`"pos"`, `"it"`, and `"ive"` with IDs `[973, 184, 1784]`, while encoding
+`" positive"` as one token `[17384]`.
 
 `CandidatePaths` holds both encodings: `bare` is the answer exactly as written,
 and `spaced` is the answer with one space in front. Encode each one together
@@ -150,9 +148,8 @@ number of prompt tokens, and the coverage.
 
 ```
 
-`measurement_from_raw` checks that each answer's paths add up to its credence
-and that the credences sum to 1, then computes the summaries. It never rescales
-or rounds the credences.
+`measurement_from_raw` checks that the credences sum to 1, then computes the
+summaries. It never rescales or rounds the credences.
 
 `to_dict()` returns a copy you can save as JSON:
 
@@ -210,26 +207,33 @@ generator you pass, so a seeded generator makes the choice reproducible.
 ## 4. Numerical rules worth remembering
 
 Logits are raw scores and can be any real number; log probabilities are at
-most 0. `masked_logprobs`, which scores a single step, returns log
-probabilities; exponentiate them to get ordinary probabilities.
-
-```pycon
->>> from credences.probabilities import masked_logprobs
->>> branch = masked_logprobs([10, 20], {10: 2.0, 20: 1.0})
->>> {token: round(math.exp(value), 6) for token, value in branch.items()}
-{10: 0.731059, 20: 0.268941}
->>> masked_logprobs([12], {})  # One allowed token is forced, without a score.
-{12: 0.0}
->>> fallback = masked_logprobs([10, 20], {10: -math.inf, 20: -math.inf})
->>> [round(math.exp(value), 6) for value in fallback.values()]
-[0.5, 0.5]
-
-```
+most 0. Each step's probabilities are a softmax over only the tokens allowed
+there. A step with one possible token has probability 1 and needs no score,
+like the step after `(10, 11)` in section 1.
 
 When every allowed token scores `-inf`, the tokens share the probability
 equally. That is equal per **token**, not per answer: answers that start with
-the same token split that token's share. A missing score, NaN, or +inf raises
-`BackendReadoutError`.
+the same token split that token's share. To keep this example short, each
+answer has one path for both spellings.
+
+```pycon
+>>> forms = {
+...     "upward": CandidatePaths((10, 11), (10, 11)),
+...     "upstairs": CandidatePaths((10, 13), (10, 13)),
+...     "down": CandidatePaths((20,), (20,)),
+... }
+>>> impossible = {
+...     (): TokenScores({10: -math.inf, 20: -math.inf}, log_normalizer=0.0),
+...     (10,): TokenScores({11: -math.inf, 13: -math.inf}, log_normalizer=0.0),
+... }
+>>> fallback = build_trie(forms).score(impossible, context_token_count=7)
+>>> {label: round(math.exp(value), 6) for label, value in fallback.credence_logprobs.items()}
+{'upward': 0.25, 'upstairs': 0.25, 'down': 0.5}
+
+```
+
+`score` checks every score before using any of them. A missing score, NaN, or
++inf raises `BackendReadoutError`.
 
 A very small probability can round to 0.0, but its log credence stays finite,
 so it remains distinct from an answer with exactly zero probability:

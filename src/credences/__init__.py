@@ -2,9 +2,10 @@
 
 Running a model is not supported yet. This version provides the result types
 and the scoring math: given token IDs for each answer and a model's logits,
-credences.trie scores both spellings of each answer and
+credences.trie computes each answer's probability and
 credences.probabilities.measurement_from_raw turns the result into a Measurement.
-See docs/pure-core.md in the repository for a walkthrough.
+See docs/pure-core.md in the repository for a walkthrough, and
+docs/tokenization.md for how answers are matched to a model's tokens.
 """
 
 from .probabilities import (

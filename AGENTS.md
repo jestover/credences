@@ -147,6 +147,12 @@ Follow `docs/style.md` and the explicit settings in `pyproject.toml`.
   docstrings. Deliberately invalid test inputs stay outside the default ty target.
 - Static checks do not replace runtime score validation, property tests, or
   tokenizer boundary tests.
+- Check data once, where it enters the package: `build_trie` checks token paths
+  and `TriePlan.score` checks every backend score before using any. Helpers
+  behind those entry points start with an underscore, live in the module that
+  uses them, and trust their inputs; their types and docstrings say what they
+  require and what goes wrong otherwise. Do not re-check the package's own
+  arithmetic; keep only guards that stop a bound or clamp from hiding a bug.
 
 ## Tests
 

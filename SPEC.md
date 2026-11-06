@@ -1222,8 +1222,9 @@ src/credences/
   credoscope.py      # Credoscope + build_credoscope; shared preparation for preview/measure;
                      # runs trie plans against a backend;
                      # the ONLY module that drives backends
-  probabilities.py   # pure: result dataclasses + §5 math, summaries, and tie helpers
-  trie.py            # pure: §7 trie over every spelling path, readout plans, validation
+  probabilities.py   # pure: TokenScores, result dataclasses, summaries, and tie helpers
+  trie.py            # pure: §7 trie over every spelling path, readout plans, §5 scoring
+                     # math; checks token paths and every backend score where they enter
   types.py           # pure: Message + ChatSpec types
   tokenization.py    # tokenizer-bound, backend-free: §8 boundary contract + Tokenizer protocol
   reasoning.py       # tokenizer-bound, backend-free: ReasoningProfile, detection, blessed registry
@@ -1377,10 +1378,13 @@ reimplementation.
   downstream users' environments. See [uv library projects](https://docs.astral.sh/uv/concepts/projects/init/#libraries).
 - Keep core dependencies minimal. Developer tools belong in the `dev` dependency
   group; `mlx` / `pandas` / `polars` remain optional runtime extras.
-- README: the §1 pitch; the forced-choice measurand (§5.1); the §5.5 token-boundary
-  and §9 estimand caveats; the §6.1 confidence summaries; and citations to CDS
-  (NBER w34965) for the binary measure and forced-choice logprob method and
-  Titelbaum for the term.
+- README: the §1 pitch; what credences mean (the §5.1 forced-choice measurand in
+  plain words); the §9 estimand caveats; the §6.1 confidence summaries; and
+  citations to CDS (NBER w34965) for the binary measure and forced-choice logprob
+  method and Titelbaum for the term. The README does not explain tokenization.
+- `docs/tokenization.md`: spellings, trimming, in-context encoding, prefills,
+  per-step restriction, and coverage (§4.1, §4.3, §5, §6.5, §8), for a reader
+  fluent in math and statistics who has never looked inside a language model.
 
 ## 16. Implementation checkpoints and deferred scope
 

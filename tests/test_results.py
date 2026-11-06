@@ -2,7 +2,6 @@
 
 import json
 import math
-from dataclasses import replace
 
 import pytest
 from hypothesis import given
@@ -110,52 +109,3 @@ def test_exported_containers_cannot_mutate_the_measurement(tied_measurement):
     assert tied_measurement.raw.scored_paths["positive"][0].token_ids == (1, 2)
     assert tied_measurement.raw.scored_paths["positive"][0].spellings == ("bare",)
     assert tied_measurement.to_dict()["top_labels"] == ["positive", "negative"]
-
-
-@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
-@pytest.mark.parametrize(
-    "field",
-    ["entropy", "top_label_confidence", "entropy_confidence", "margin_confidence"],
-)
-def test_nonfinite_summaries_cannot_escape_as_invalid_json(tied_measurement, field, value):
-    malformed = replace(tied_measurement, **{field: value})
-
-    with pytest.raises(ValueError, match=field):
-        malformed.to_dict()
-
-
-@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
-def test_nonfinite_credences_cannot_escape_as_invalid_json(tied_measurement, value):
-    malformed = replace(tied_measurement, credences={"positive": value, "negative": 0.5})
-
-    with pytest.raises(ValueError, match="credences"):
-        malformed.to_dict()
-
-
-@pytest.mark.parametrize("value", [math.nan, math.inf])
-def test_only_negative_infinity_logprobs_can_become_null(tied_measurement, value):
-    malformed_raw = replace(
-        tied_measurement.raw,
-        credence_logprobs={"positive": value, "negative": -math.log(2)},
-    )
-
-    with pytest.raises(ValueError, match="credence_logprobs"):
-        replace(tied_measurement, raw=malformed_raw).to_dict()
-
-
-@pytest.mark.parametrize("value", [math.nan, math.inf])
-def test_invalid_path_logprobs_cannot_escape_as_invalid_json(tied_measurement, value):
-    paths = dict(tied_measurement.raw.scored_paths)
-    paths["negative"] = (ScoredPath(("bare",), (3,), value),)
-    malformed_raw = replace(tied_measurement.raw, scored_paths=paths)
-
-    with pytest.raises(ValueError, match="scored_paths"):
-        replace(tied_measurement, raw=malformed_raw).to_dict()
-
-
-@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
-def test_nonfinite_coverage_cannot_escape_as_invalid_json(tied_measurement, value):
-    malformed_raw = replace(tied_measurement.raw, coverage=value)
-
-    with pytest.raises(ValueError, match="coverage"):
-        replace(tied_measurement, raw=malformed_raw).to_dict()

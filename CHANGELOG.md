@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Check data once, where it enters: `build_trie` checks token paths, and
+  `TriePlan.score` checks every backend score before using any. The scoring
+  arithmetic (`logsumexp`, `logprob_sum`, `masked_logprobs`, `coverage`,
+  `validate_readout`, `validate_token_scores`) is now private to
+  `credences.trie` and trusts its input. `measurement_from_raw` checks only
+  that there are at least two candidates and that credences sum to 1, which
+  also rejects NaN, infinite, and positive log credences; it no longer re-adds
+  paths or checks coverage and the prompt token count. `to_dict` no longer
+  re-checks values. `TriePlan.paths` is now a dict. Credences are unchanged.
+  The private helpers take a `_LogWeight` type (a float that is finite or
+  `-inf`) that only the backend check creates, so ty rejects unchecked numbers,
+  and each docstring says what the helper requires. A NaN reaching the
+  grouped-probability step now stays NaN instead of becoming probability 1.
+- Move the explanation of spellings and tokenization from the README to a new
+  `docs/tokenization.md`, written for readers new to how language models work.
+  The README now covers what the package is for and what its results mean, and
+  its token-ID example lives in the walkthrough.
 - Implement summed spellings in the pure core (PLAN Phase 1b). `build_trie`
   takes each candidate's `CandidatePaths`, checks them before any model call,
   and plans readouts that always start at the scoring position; `TriePlan.score`

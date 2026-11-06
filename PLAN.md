@@ -180,7 +180,8 @@ mapping, scheduler, or cross-call inference/KV cache. Pure trie-plan reuse is al
 
 1. Optional `frames.py` adapter for `list[Measurement]`.
 2. README quickstart with preview-before-measurement, forced-choice semantics,
-   two-spelling/prefill and reasoning caveats, confidence summaries, and citations.
+   reasoning caveats, confidence summaries, and citations. Spelling and prefill
+   details stay in `docs/tokenization.md`.
 3. Deployment note: independently retryable shards, one model load per worker,
    and weights pre-staged in shared or node-local storage.
 4. Publish `credences==0.1.0` after a clean-environment quickstart succeeds.
